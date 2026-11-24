@@ -1,9 +1,10 @@
 /**
  * Worldbook Entry Groups — Pure domain model, IF-line mutex planner,
- * per-chat save route recognizer, greeting comment coordinator, and auto-grouping engine.
+ * O(1) metadata-only per-chat route memory (supports in-save timeline jumps like 18yo -> 30yo),
+ * scene-triggered auto-groups (e.g. NSFW off in daily plot / on during intimate scenes),
+ * and prefix/divider/greeting auto-grouping engine.
  *
- * Zero DOM or browser globals required so every function is deterministic
- * and directly testable in Node.js.
+ * Zero DOM or browser globals required; zero multi-floor chat history scanning.
  */
 
 export const MODULE_NAME = 'worldbook_entry_groups';
@@ -14,6 +15,7 @@ export const GROUP_MODES = Object.freeze({
     NORMAL: 'normal',
     IF_LINE: 'if_line',
     RADIO: 'radio',
+    SCENE: 'scene',
 });
 
 export const VALID_PALETTES = Object.freeze(['paper', 'ink', 'warm', 'sakura', 'host']);
@@ -27,6 +29,21 @@ const LORE_TAG_REGEX = /<!---?[\s\u3000]*lore[\s\u3000]*[:：][\s\u3000]*([\d,\s
 const EXCLUDE_TAG_REGEX = /<!---?[\s\u3000]*exclude[\s\u3000]*[:：][\s\u3000]*([\d,\s\u3000，]+)[\s\u3000]*-?-->/i;
 
 const IF_NAME_HINT_REGEX = /(?:^|[\s【\[「(（·\-_/:：|｜])(?:if\s*线?|分支|路线|支线|世界线|结局线|if\d+|\d+岁线?)(?:$|[\s】\]」)）·\-_/:：|｜\d])/i;
+const NSFW_TITLE_HINT_REGEX = /\b(?:nsfw|r18|18\+|smut|ero)\b|(?:亲密剧情|亲密行为|亲密设定|情事|床笫|欢爱|肉体设定|敏感带|敏感点|性癖|瑟瑟|涩涩|成人向|情欲|交合|体位)/i;
+
+/**
+ * Built-in default trigger cues when a `scene` group leaves custom keywords blank.
+ * Matched ONLY against the latest 1–2 turn snippets (capped to ~600 chars per turn).
+ */
+export const DEFAULT_SCENE_KEYWORDS = Object.freeze([
+    '亲吻', '深吻', '接吻', '吻住', '唇舌', '舌尖',
+    '喘息', '低喘', '娇喘', '呻吟',
+    '褪去', '解开衣', '衣扣', '衣衫半解', '赤裸', '寸缕',
+    '锁骨', '耳垂', '腰肢', '腿间', '私密', '下身',
+    '情欲', '动情', '欲望', '滚烫', '缠绵',
+    '交合', '进入身体', '抵住', '抽送', '顶弄', '高潮', '痉挛',
+    'nsfw', 'r18',
+]);
 
 /**
  * Generate a compact unique group ID.
@@ -39,11 +56,31 @@ export function createGroupId(prefix = 'grp') {
 }
 
 /**
+ * Parse a comma/newline separated keyword string into a deduplicated string list.
+ * @param {string | string[] | null | undefined} raw
+ * @returns {string[]}
+ */
+export function normalizeKeywordList(raw) {
+    const items = Array.isArray(raw)
+        ? raw
+        : String(raw ?? '').split(/[,，、;\n\r]+/);
+    const seen = new Set();
+    const out = [];
+    for (const item of items) {
+        const clean = String(item ?? '').trim().toLowerCase();
+        if (clean && !seen.has(clean)) {
+            seen.add(clean);
+            out.push(clean);
+        }
+    }
+    return out.slice(0, 60);
+}
+
+/**
  * Normalize a single book's group configuration in place or from raw data.
  * Never touches worldbook entries; stores only plugin-local group metadata.
  *
  * @param {any} raw
- * @returns {{ groups: Array<{ id: string, name: string, mode: 'normal' | 'if_line' | 'radio', collapsed: boolean }>, assignments: Record<string, string>, ungroupedCollapsed: boolean }}
  */
 export function normalizeBookConfig(raw) {
     const src = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
@@ -57,15 +94,28 @@ export function normalizeBookConfig(raw) {
             const name = String(item.name ?? '').trim();
             if (!id || !name || id === SPECIAL_GROUP_UNGROUPED || seenIds.has(id)) continue;
             seenIds.add(id);
+
             const rawMode = String(item.mode ?? '').trim();
-            const mode = rawMode === GROUP_MODES.IF_LINE || rawMode === GROUP_MODES.RADIO
+            const mode = (
+                rawMode === GROUP_MODES.IF_LINE ||
+                rawMode === GROUP_MODES.RADIO ||
+                rawMode === GROUP_MODES.SCENE
+            )
                 ? rawMode
                 : GROUP_MODES.NORMAL;
+
+            const rawCooldown = Number.parseInt(String(item.cooldownTurns ?? 2), 10);
+            const cooldownTurns = Number.isInteger(rawCooldown)
+                ? Math.max(1, Math.min(10, rawCooldown))
+                : 2;
+
             groups.push({
                 id,
                 name,
                 mode,
                 collapsed: Boolean(item.collapsed),
+                sceneKeywords: normalizeKeywordList(item.sceneKeywords),
+                cooldownTurns,
             });
         }
     }
@@ -89,16 +139,9 @@ export function normalizeBookConfig(raw) {
 
 /**
  * Normalize a per-chat worldbook route profile (`chatMetadata` or fallback `chatProfiles[chatKey]`).
+ * Lightweight metadata (~100-300 bytes), O(1) read/write, zero chat message scanning!
  *
  * @param {any} raw
- * @returns {{
- *   worldName: string,
- *   routeLabel: string,
- *   ifGroupId: string,
- *   greetingSwipeIndex: number | null,
- *   entryDisabledMap: Record<string, boolean>,
- *   updatedAt: number
- * } | null}
  */
 export function normalizeChatProfile(raw) {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
@@ -116,9 +159,6 @@ export function normalizeChatProfile(raw) {
 
     const ifGroupId = String(raw.ifGroupId ?? '').trim();
     const routeLabel = String(raw.routeLabel ?? '').trim();
-    const swipeIdx = Number.isInteger(raw.greetingSwipeIndex) && raw.greetingSwipeIndex >= 0
-        ? raw.greetingSwipeIndex
-        : null;
 
     if (!ifGroupId && Object.keys(entryDisabledMap).length === 0) return null;
 
@@ -126,7 +166,6 @@ export function normalizeChatProfile(raw) {
         worldName,
         routeLabel,
         ifGroupId,
-        greetingSwipeIndex: swipeIdx,
         entryDisabledMap,
         updatedAt: Number.isFinite(Number(raw.updatedAt)) ? Number(raw.updatedAt) : 0,
     };
@@ -139,7 +178,10 @@ export function normalizeChatProfile(raw) {
 export function cloneBookConfig(bookConfig) {
     const norm = normalizeBookConfig(bookConfig);
     return {
-        groups: norm.groups.map((g) => ({ ...g })),
+        groups: norm.groups.map((g) => ({
+            ...g,
+            sceneKeywords: [...(g.sceneKeywords || [])],
+        })),
         assignments: { ...norm.assignments },
         ungroupedCollapsed: norm.ungroupedCollapsed,
     };
@@ -167,7 +209,6 @@ export function normalizeSettings(raw) {
         }
     }
 
-    // Normalize & cap LRU per-chat route bindings
     const chatProfiles = {};
     if (src.chatProfiles && typeof src.chatProfiles === 'object' && !Array.isArray(src.chatProfiles)) {
         const validPairs = [];
@@ -191,9 +232,11 @@ export function normalizeSettings(raw) {
         palette,
         colorMode,
         showNativeEntryBtn: src.showNativeEntryBtn !== false,
+        showWandMenuEntry: src.showWandMenuEntry !== false,
         closeOnLocate: src.closeOnLocate !== false,
         syncGreetingTags: src.syncGreetingTags !== false,
         autoSwitchOnChatChange: src.autoSwitchOnChatChange !== false,
+        enableSceneAutoToggle: src.enableSceneAutoToggle !== false,
         searchMultiTerm: Boolean(src.searchMultiTerm),
         lastOpenedBook: String(src.lastOpenedBook ?? '').trim(),
         books,
@@ -203,10 +246,6 @@ export function normalizeSettings(raw) {
 
 /**
  * Store or update a fallback per-chat route profile inside `settings.chatProfiles` with LRU cap.
- *
- * @param {Record<string, any>} settings
- * @param {string} chatKey
- * @param {any} rawProfile
  */
 export function upsertStoredChatProfile(settings, chatKey, rawProfile) {
     const cleanKey = String(chatKey ?? '').trim();
@@ -231,12 +270,7 @@ export function upsertStoredChatProfile(settings, chatKey, rawProfile) {
 }
 
 /**
- * Check whether an entry comment looks like a visual section divider banner,
- * e.g. `=== 角色设定 ===`, `--- IF线：校园 ---`, `────── 剧情 ──────`.
- *
- * @param {string} rawComment
- * @param {{ disabled?: boolean, hasContent?: boolean, keyCount?: number }} [meta]
- * @returns {{ isDivider: boolean, label: string }}
+ * Check whether an entry comment looks like a visual section divider banner.
  */
 export function parseDividerComment(rawComment, meta = {}) {
     const text = String(rawComment ?? '').trim();
@@ -275,8 +309,6 @@ export function parseDividerComment(rawComment, meta = {}) {
 /**
  * Extract lightweight entry summaries from a raw worldbook JSON object.
  * Discards `entry.content` immediately so 200+ entries consume minimal memory on iOS WebViews.
- *
- * @param {any} payload
  */
 export function extractWorldbookEntrySummaries(payload) {
     const entriesObj = payload?.entries;
@@ -343,10 +375,6 @@ export function extractWorldbookEntrySummaries(payload) {
 
 /**
  * Remove orphan entry UID assignments that no longer exist in the authoritative worldbook.
- *
- * @param {{ groups: any[], assignments: Record<string, string> }} bookConfig
- * @param {Set<string>} validUidSet
- * @returns {number} Number of removed orphan assignments
  */
 export function pruneOrphanAssignments(bookConfig, validUidSet) {
     if (!bookConfig?.assignments || !(validUidSet instanceof Set)) return 0;
@@ -363,16 +391,12 @@ export function pruneOrphanAssignments(bookConfig, validUidSet) {
 
 /**
  * Build the structured group sections view purely from authoritative entries + bookConfig.
- *
- * @param {Array<any>} entries
- * @param {any} rawBookConfig
  */
 export function buildGroupedView(entries, rawBookConfig) {
     const bookConfig = normalizeBookConfig(rawBookConfig);
     const list = Array.isArray(entries) ? entries : [];
     const validUidSet = new Set(list.map((e) => e.uid));
 
-    /** @type {Map<string, any[]>} */
     const bucketMap = new Map();
     for (const grp of bookConfig.groups) {
         bucketMap.set(grp.id, []);
@@ -397,6 +421,8 @@ export function buildGroupedView(entries, rawBookConfig) {
             name: grp.name,
             mode: grp.mode,
             collapsed: Boolean(grp.collapsed),
+            sceneKeywords: grp.sceneKeywords || [],
+            cooldownTurns: grp.cooldownTurns || 2,
             isUngrouped: false,
             entries: items,
             totalCount,
@@ -412,6 +438,8 @@ export function buildGroupedView(entries, rawBookConfig) {
         name: '未分组',
         mode: GROUP_MODES.NORMAL,
         collapsed: Boolean(bookConfig.ungroupedCollapsed),
+        sceneKeywords: [],
+        cooldownTurns: 2,
         isUngrouped: true,
         entries: ungroupedEntries,
         totalCount: ungroupedEntries.length,
@@ -446,11 +474,6 @@ export function buildGroupedView(entries, rawBookConfig) {
 
 /**
  * Filter entries by search query and optional state filter.
- *
- * @param {Array<any>} entries
- * @param {string} query
- * @param {{ multiTerm?: boolean, statusFilter?: 'all' | 'enabled' | 'disabled', greetingByUid?: Map<string, any> | null }} [opts]
- * @returns {Set<string>}
  */
 export function matchEntries(entries, query, { multiTerm = false, statusFilter = 'all', greetingByUid = null } = {}) {
     const list = Array.isArray(entries) ? entries : [];
@@ -487,12 +510,6 @@ export function matchEntries(entries, query, { multiTerm = false, statusFilter =
 
 /**
  * Compute a single-pass batch toggle plan (`Map<uid, nextDisabled>`) when toggling an entire group.
- *
- * @param {Array<any>} entries
- * @param {any} rawBookConfig
- * @param {string} groupId
- * @param {boolean} targetEnabled
- * @returns {Map<string, boolean>}
  */
 export function computeGroupTogglePlan(entries, rawBookConfig, groupId, targetEnabled) {
     const bookConfig = normalizeBookConfig(rawBookConfig);
@@ -554,12 +571,6 @@ export function computeGroupTogglePlan(entries, rawBookConfig, groupId, targetEn
 
 /**
  * Compute a single-pass batch toggle plan (`Map<uid, nextDisabled>`) when toggling a single entry.
- *
- * @param {Array<any>} entries
- * @param {any} rawBookConfig
- * @param {string} uid
- * @param {boolean} targetEnabled
- * @returns {Map<string, boolean>}
  */
 export function computeEntryTogglePlan(entries, rawBookConfig, uid, targetEnabled) {
     const bookConfig = normalizeBookConfig(rawBookConfig);
@@ -604,12 +615,95 @@ export function computeEntryTogglePlan(entries, rawBookConfig, uid, targetEnable
 }
 
 /**
+ * Evaluate `scene` groups (e.g. NSFW / intimate lore) right before prompt WorldInfo assembly!
+ * Inspects ONLY a tiny recent turn snippet (`recentText`, capped ~1200 chars — zero chat history scan):
+ * - Turns ON a `scene` group immediately when its trigger cues appear in the latest 1–2 turns,
+ *   setting its remaining active window to `cooldownTurns` (default 2 turns).
+ * - Keeps it ON while `cooldown > 0` so brief dialogue exchanges mid-scene don't flicker off.
+ * - Turns it OFF automatically once `cooldown` reaches 0 in normal peaceful plot!
+ *
+ * @param {{
+ *   entries: Array<any>,
+ *   bookConfig: any,
+ *   recentText: string,
+ *   cooldownByGroupId?: Record<string, number>
+ * }} params
+ * @returns {{
+ *   togglePlan: Map<string, boolean>,
+ *   nextCooldownByGroupId: Record<string, number>,
+ *   activatedGroups: string[],
+ *   deactivatedGroups: string[]
+ * }}
+ */
+export function evaluateSceneAutoToggle({
+    entries,
+    bookConfig: rawBookConfig,
+    recentText,
+    cooldownByGroupId = {},
+}) {
+    const bookConfig = normalizeBookConfig(rawBookConfig);
+    const list = Array.isArray(entries) ? entries : [];
+    const togglePlan = new Map();
+    const nextCooldownByGroupId = { ...(cooldownByGroupId || {}) };
+    const activatedGroups = [];
+    const deactivatedGroups = [];
+
+    const sceneGroups = bookConfig.groups.filter((g) => g.mode === GROUP_MODES.SCENE);
+    if (sceneGroups.length === 0 || list.length === 0) {
+        return { togglePlan, nextCooldownByGroupId, activatedGroups, deactivatedGroups };
+    }
+
+    const sample = String(recentText ?? '').slice(-1500).toLowerCase();
+
+    for (const grp of sceneGroups) {
+        const groupEntries = list.filter((e) => bookConfig.assignments[e.uid] === grp.id);
+        if (groupEntries.length === 0) continue;
+
+        const keywords = grp.sceneKeywords && grp.sceneKeywords.length > 0
+            ? grp.sceneKeywords
+            : DEFAULT_SCENE_KEYWORDS;
+
+        const isHit = Boolean(sample) && keywords.some((kw) => kw && sample.includes(kw));
+        const prevCooldown = Number(nextCooldownByGroupId[grp.id] || 0);
+
+        let shouldBeEnabled = false;
+        if (isHit) {
+            shouldBeEnabled = true;
+            nextCooldownByGroupId[grp.id] = grp.cooldownTurns || 2;
+        } else if (prevCooldown > 0) {
+            shouldBeEnabled = true;
+            nextCooldownByGroupId[grp.id] = prevCooldown - 1;
+        } else {
+            shouldBeEnabled = false;
+            nextCooldownByGroupId[grp.id] = 0;
+        }
+
+        const desiredDisabled = !shouldBeEnabled;
+        let anyChangedInGroup = false;
+        for (const entry of groupEntries) {
+            if (Boolean(entry.disabled) !== desiredDisabled) {
+                togglePlan.set(entry.uid, desiredDisabled);
+                anyChangedInGroup = true;
+            }
+        }
+
+        if (anyChangedInGroup) {
+            if (shouldBeEnabled) activatedGroups.push(grp.name);
+            else deactivatedGroups.push(grp.name);
+        }
+    }
+
+    return {
+        togglePlan,
+        nextCooldownByGroupId,
+        activatedGroups,
+        deactivatedGroups,
+    };
+}
+
+/**
  * Apply a `uid -> nextDisabled` toggle plan onto a raw worldbook JSON payload in place.
  * Modifies ONLY `entry.disable`; 100% of titles, content, inclusion groups, and extensions remain untouched.
- *
- * @param {any} payload
- * @param {Map<string, boolean>} togglePlan
- * @returns {{ changedCount: number, appliedChanges: Array<{ uid: string, disabled: boolean }> }}
  */
 export function applyTogglePlanToPayload(payload, togglePlan) {
     const entriesObj = payload?.entries;
@@ -650,30 +744,10 @@ export function applyTogglePlanToPayload(payload, togglePlan) {
 }
 
 /**
- * Strip HTML metadata comments (`<!-- ... -->`), `<greetings>` directory blocks, and collapse whitespace
- * to build a clean narrative text fingerprint for matching multi-floor chat openings back to card greetings.
- *
- * @param {string} rawText
- * @returns {string}
- */
-export function buildNarrativeFingerprint(rawText) {
-    const text = String(rawText ?? '');
-    if (!text) return '';
-    return text
-        .replace(/<!--[\s\S]*?-->/g, ' ')
-        .replace(/<greetings>[\s\S]*?<\/greetings>/gi, ' ')
-        .replace(/\s+/g, ' ')
-        .trim();
-}
-
-/**
- * Parse greeting HTML comment tags (`<!-- title / desc / lore / exclude -->`).
- *
- * @param {string} rawText
- * @returns {{ title: string, desc: string, loreUids: string[], excludeUids: string[] }}
+ * Parse greeting HTML comment tags (`<!-- title / desc / lore / exclude -->`) on a single greeting string.
  */
 export function parseGreetingCommentTags(rawText) {
-    const text = String(rawText ?? '');
+    const text = String(rawText ?? '').slice(0, 1200);
     if (!text) return { title: '', desc: '', loreUids: [], excludeUids: [] };
 
     const titleMatch = text.match(TITLE_TAG_REGEX);
@@ -707,11 +781,7 @@ export function parseGreetingCommentTags(rawText) {
 }
 
 /**
- * Build a greeting coordination index from a character's `first_mes` + `alternate_greetings`
- * (ALWAYS preserving the full character-card greeting catalog so branched or multi-floor chats
- * never lose sibling IF-line `managedUidSet`!).
- *
- * @param {{ firstMes?: string, alternateGreetings?: string[], swipes?: string[], currentSwipeId?: number | null }} source
+ * Build a greeting coordination index purely from character card greeting headers (reads first 1200 chars per greeting).
  */
 export function buildGreetingCoordinationIndex(source = {}) {
     const cardGreetingsRaw = [];
@@ -727,18 +797,15 @@ export function buildGreetingCoordinationIndex(source = {}) {
         ? source.swipes.map((s) => String(s ?? ''))
         : [];
 
-    // Prefer full character card greetings when available (branched chats often trim `swipes` to length 1!)
     const baseList = cardGreetingsRaw.length >= swipeRaw.length && cardGreetingsRaw.length > 0
         ? cardGreetingsRaw
         : swipeRaw;
 
     const greetings = [];
-    /** @type {Map<string, { includeGreetings: Array<{ swipeIndex: number, label: string, title: string }>, excludeGreetings: Array<{ swipeIndex: number, label: string, title: string }> }>} */
     const byUid = new Map();
     const managedUidSet = new Set();
 
     baseList.forEach((raw, swipeIndex) => {
-        // Merge live swipe edits if `swipes[swipeIndex]` exists and carries tags
         const parsedCard = parseGreetingCommentTags(raw);
         const parsedSwipe = swipeRaw[swipeIndex] ? parseGreetingCommentTags(swipeRaw[swipeIndex]) : null;
         const parsed = (parsedSwipe && (parsedSwipe.loreUids.length > 0 || parsedSwipe.excludeUids.length > 0 || parsedSwipe.title))
@@ -746,7 +813,6 @@ export function buildGreetingCoordinationIndex(source = {}) {
             : parsedCard;
 
         const label = `#${swipeIndex}`;
-        const fingerprint = buildNarrativeFingerprint(raw);
         const info = {
             swipeIndex,
             label,
@@ -754,7 +820,6 @@ export function buildGreetingCoordinationIndex(source = {}) {
             desc: parsed.desc || parsedCard.desc,
             loreUids: parsed.loreUids,
             excludeUids: parsed.excludeUids,
-            fingerprintSlice: fingerprint.slice(0, 140),
         };
         greetings.push(info);
 
@@ -787,123 +852,32 @@ export function buildGreetingCoordinationIndex(source = {}) {
 }
 
 /**
- * Infer which IF-line route / greeting an existing multi-floor chat save belongs to!
- * Solves the core multi-save pain points:
- * 1. Reads actual `msg.mes` from newest floor down to floor 0 (supports mid-chat inserted timeline greetings,
- *    and NEVER falls into the `msg0.swipe_id || 0 -> swipes[0] (#0 目录页)` trap after chatting several floors!).
- * 2. Even if `<!-- lore: ... -->` comments were stripped from `chat[0].mes`, reverse-matches `chat[0].mes`
- *    narrative text against the character card's `first_mes` + `alternate_greetings` to recover the exact route!
- * 3. Uses the character card's full `managedUidSet` so branched saves (`/branch`) cleanly disable sibling IF lines!
- * 4. Maps matched greeting UIDs or title onto any matching plugin `if_line` group automatically.
- *
- * @param {{
- *   worldName: string,
- *   chatMessages: Array<{ mes?: string, is_user?: boolean }>,
- *   greetingIndex: ReturnType<typeof buildGreetingCoordinationIndex> | null,
- *   bookConfig?: any
- * }} params
- * @returns {ReturnType<typeof normalizeChatProfile>}
+ * Capture initial route ONLY on a brand-new 1-message chat (`chat.length === 1`)
+ * by reading the first 1200 chars of `floorZeroMes`.
+ * NEVER touches or iterates multi-floor chat history!
  */
-export function inferChatRouteFromMessages({
+export function buildInitialProfileFromFloorZero({
     worldName,
-    chatMessages = [],
+    floorZeroMes,
     greetingIndex = null,
     bookConfig = null,
 }) {
     const cleanWorld = String(worldName ?? '').trim();
-    if (!cleanWorld || !Array.isArray(chatMessages) || chatMessages.length === 0) return null;
+    if (!cleanWorld || !floorZeroMes) return null;
+
+    const parsed = parseGreetingCommentTags(floorZeroMes);
+    if (parsed.loreUids.length === 0 && parsed.excludeUids.length === 0) return null;
 
     const normBook = normalizeBookConfig(bookConfig);
     const ifGroups = normBook.groups.filter((g) => g.mode === GROUP_MODES.IF_LINE);
-    const cardGreetings = greetingIndex?.greetings || [];
     const allManagedUids = greetingIndex?.managedUidSet || new Set();
 
-    let matchedGreeting = null;
-    let inlineParsed = null;
-
-    // 1. Scan non-user messages from newest floor down to floor 0 for explicit `<!-- lore / exclude / title -->`
-    for (let i = chatMessages.length - 1; i >= 0; i -= 1) {
-        const msg = chatMessages[i];
-        if (!msg || msg.is_user) continue;
-        const text = String(msg.mes ?? '');
-        if (!text) continue;
-
-        const parsed = parseGreetingCommentTags(text);
-        if (parsed.loreUids.length > 0 || parsed.excludeUids.length > 0) {
-            inlineParsed = parsed;
-            // Try matching back to a numbered card greeting for friendly title
-            const msgFp = buildNarrativeFingerprint(text).slice(0, 120);
-            matchedGreeting = cardGreetings.find((g) =>
-                (parsed.title && g.title === parsed.title) ||
-                (msgFp.length >= 18 && g.fingerprintSlice && g.fingerprintSlice.startsWith(msgFp.slice(0, 48))),
-            ) || null;
-            break;
-        }
-    }
-
-    // 2. Reverse-match narrative body if `chat[0].mes` (or inserted greeting) lost its HTML comment tags!
-    if (!inlineParsed && cardGreetings.length > 0) {
-        // Check floor 0 first (most common opening), plus any other non-user message that matches a greeting
-        const candidateIndices = [0];
-        for (let i = chatMessages.length - 1; i >= 1; i -= 1) {
-            if (!chatMessages[i]?.is_user) candidateIndices.push(i);
-        }
-        // Prefer latest inserted greeting if any floor > 0 matches a card greeting verbatim; otherwise floor 0
-        for (const floorIdx of [...candidateIndices.slice(1), 0]) {
-            const rawMes = String(chatMessages[floorIdx]?.mes ?? '');
-            const fp = buildNarrativeFingerprint(rawMes);
-            if (fp.length < 16) continue;
-            const probe = fp.slice(0, 80);
-
-            const found = cardGreetings.find((g) => {
-                if (!g.fingerprintSlice || g.fingerprintSlice.length < 16) return false;
-                if (g.loreUids.length === 0 && g.excludeUids.length === 0 && !g.title) return false;
-                return g.fingerprintSlice.startsWith(probe) || fp.startsWith(g.fingerprintSlice.slice(0, 80));
-            });
-            if (found) {
-                matchedGreeting = found;
-                inlineParsed = {
-                    title: found.title,
-                    desc: found.desc,
-                    loreUids: found.loreUids,
-                    excludeUids: found.excludeUids,
-                };
-                break;
-            }
-        }
-    }
-
-    // Also check if floor 0 has a `<!-- title: ... -->` tag matching an IF-line group name even without `lore` UIDs
-    if (!inlineParsed && ifGroups.length > 0 && chatMessages[0] && !chatMessages[0].is_user) {
-        const p0 = parseGreetingCommentTags(String(chatMessages[0].mes ?? ''));
-        const candidateTitle = p0.title;
-        if (candidateTitle) {
-            const matchedGrp = ifGroups.find(
-                (g) => g.name === candidateTitle || g.name.includes(candidateTitle) || candidateTitle.includes(g.name),
-            );
-            if (matchedGrp) {
-                return normalizeChatProfile({
-                    worldName: cleanWorld,
-                    routeLabel: matchedGrp.name,
-                    ifGroupId: matchedGrp.id,
-                    greetingSwipeIndex: null,
-                    entryDisabledMap: {},
-                    updatedAt: Date.now(),
-                });
-            }
-        }
-    }
-
-    if (!inlineParsed) return null;
-
-    const activeSet = new Set(inlineParsed.loreUids);
-    const excludeSet = new Set(inlineParsed.excludeUids);
+    const activeSet = new Set(parsed.loreUids);
+    const excludeSet = new Set(parsed.excludeUids);
     const entryDisabledMap = {};
 
-    // Disable all sibling greeting-managed UIDs not active in this save's greeting, enable active ones!
     for (const uid of allManagedUids) {
-        const shouldEnable = activeSet.has(uid) && !excludeSet.has(uid);
-        entryDisabledMap[uid] = !shouldEnable;
+        entryDisabledMap[uid] = !(activeSet.has(uid) && !excludeSet.has(uid));
     }
     for (const uid of activeSet) {
         entryDisabledMap[uid] = excludeSet.has(uid);
@@ -912,50 +886,33 @@ export function inferChatRouteFromMessages({
         entryDisabledMap[uid] = true;
     }
 
-    // Check if these active UIDs or title also correspond to one of the user's `if_line` groups
     let matchedIfGroup = null;
-    if (ifGroups.length > 0) {
-        let bestOverlap = 0;
-        for (const grp of ifGroups) {
-            const grpUids = Object.entries(normBook.assignments)
-                .filter(([, gid]) => gid === grp.id)
-                .map(([u]) => u);
-            const overlap = grpUids.filter((u) => activeSet.has(u)).length;
-            if (overlap > bestOverlap) {
-                bestOverlap = overlap;
-                matchedIfGroup = grp;
-            }
-        }
-        if (!matchedIfGroup && (inlineParsed.title || matchedGreeting?.title)) {
-            const t = (inlineParsed.title || matchedGreeting?.title || '').trim();
-            matchedIfGroup = ifGroups.find((g) => g.name === t || g.name.includes(t) || t.includes(g.name)) || null;
+    let bestOverlap = 0;
+    for (const grp of ifGroups) {
+        const grpUids = Object.entries(normBook.assignments)
+            .filter(([, gid]) => gid === grp.id)
+            .map(([u]) => u);
+        const overlap = grpUids.filter((u) => activeSet.has(u)).length;
+        if (overlap > bestOverlap) {
+            bestOverlap = overlap;
+            matchedIfGroup = grp;
         }
     }
 
-    const displayTitle = matchedIfGroup?.name
-        || inlineParsed.title
-        || matchedGreeting?.title
-        || (matchedGreeting ? `开场白 ${matchedGreeting.label}` : '开场白联动路线');
-
+    const routeLabel = matchedIfGroup?.name || parsed.title || '开场白初始路线';
     return normalizeChatProfile({
         worldName: cleanWorld,
-        routeLabel: displayTitle,
+        routeLabel,
         ifGroupId: matchedIfGroup?.id || '',
-        greetingSwipeIndex: matchedGreeting ? matchedGreeting.swipeIndex : null,
         entryDisabledMap,
         updatedAt: Date.now(),
     });
 }
 
 /**
- * Snapshot the current worldbook's IF-line & grouped entry states into a per-chat save profile.
- * Called automatically when toggling groups in an active chat, or manually via "绑定到当前存档".
- *
- * @param {string} worldName
- * @param {Array<any>} entries
- * @param {any} rawBookConfig
- * @param {{ preferredIfGroupId?: string, customLabel?: string, greetingIndex?: any }} [opts]
- * @returns {ReturnType<typeof normalizeChatProfile>}
+ * Snapshot the current worldbook's IF-line & non-scene grouped entry states into a per-chat save profile.
+ * Supports seamless in-save timeline jumps (e.g., switching from 18岁线 -> 30岁线 mid-save updates `chatMetadata`
+ * to 30岁线 immediately, and excludes transient `scene`/NSFW toggles from permanent route lock!).
  */
 export function buildChatProfileFromCurrentState(worldName, entries, rawBookConfig, opts = {}) {
     const cleanWorld = String(worldName ?? '').trim();
@@ -963,9 +920,11 @@ export function buildChatProfileFromCurrentState(worldName, entries, rawBookConf
     if (!cleanWorld || list.length === 0) return null;
 
     const bookConfig = normalizeBookConfig(rawBookConfig);
+    const sceneGroupIds = new Set(
+        bookConfig.groups.filter((g) => g.mode === GROUP_MODES.SCENE).map((g) => g.id),
+    );
     const managedGreetingUids = opts.greetingIndex?.managedUidSet || new Set();
 
-    // Determine active IF-line group
     let activeIfGroup = null;
     if (opts.preferredIfGroupId) {
         activeIfGroup = bookConfig.groups.find(
@@ -982,11 +941,15 @@ export function buildChatProfileFromCurrentState(worldName, entries, rawBookConf
         }
     }
 
-    // Record states of grouped entries + greeting-managed entries; if neither exists, snapshot all entries
-    const hasAnyGroupOrManaged = Object.keys(bookConfig.assignments).length > 0 || managedGreetingUids.size > 0;
+    const nonSceneAssignedCount = Object.values(bookConfig.assignments).filter((gid) => !sceneGroupIds.has(gid)).length;
+    const hasAnyGroupOrManaged = nonSceneAssignedCount > 0 || managedGreetingUids.size > 0;
     const entryDisabledMap = {};
+
     for (const entry of list) {
-        if (!hasAnyGroupOrManaged || bookConfig.assignments[entry.uid] || managedGreetingUids.has(entry.uid)) {
+        const gid = bookConfig.assignments[entry.uid];
+        // Never lock transient `scene` (NSFW) group states into the save's permanent route profile
+        if (gid && sceneGroupIds.has(gid)) continue;
+        if (!hasAnyGroupOrManaged || gid || managedGreetingUids.has(entry.uid)) {
             entryDisabledMap[entry.uid] = Boolean(entry.disabled);
         }
     }
@@ -1000,7 +963,6 @@ export function buildChatProfileFromCurrentState(worldName, entries, rawBookConf
         worldName: cleanWorld,
         routeLabel,
         ifGroupId: activeIfGroup?.id || '',
-        greetingSwipeIndex: null,
         entryDisabledMap,
         updatedAt: Date.now(),
     });
@@ -1008,11 +970,6 @@ export function buildChatProfileFromCurrentState(worldName, entries, rawBookConf
 
 /**
  * Compute the single-pass `Map<uid, nextDisabled>` needed to restore a chat save's bound profile!
- *
- * @param {Array<any>} entries
- * @param {any} rawBookConfig
- * @param {any} rawChatProfile
- * @returns {Map<string, boolean>}
  */
 export function computeChatProfileRestorePlan(entries, rawBookConfig, rawChatProfile) {
     const profile = normalizeChatProfile(rawChatProfile);
@@ -1021,9 +978,11 @@ export function computeChatProfileRestorePlan(entries, rawBookConfig, rawChatPro
     if (!profile || list.length === 0) return plan;
 
     const bookConfig = normalizeBookConfig(rawBookConfig);
+    const sceneGroupIds = new Set(
+        bookConfig.groups.filter((g) => g.mode === GROUP_MODES.SCENE).map((g) => g.id),
+    );
     const validUidSet = new Set(list.map((e) => e.uid));
 
-    // 1. Apply bound IF-line group mutex rule first (if group still exists)
     if (profile.ifGroupId && bookConfig.groups.some((g) => g.id === profile.ifGroupId)) {
         const groupPlan = computeGroupTogglePlan(list, bookConfig, profile.ifGroupId, true);
         for (const [uid, nextDisabled] of groupPlan.entries()) {
@@ -1031,14 +990,13 @@ export function computeChatProfileRestorePlan(entries, rawBookConfig, rawChatPro
         }
     }
 
-    // 2. Overlay exact recorded entry states for this chat save
     for (const [uid, nextDisabled] of Object.entries(profile.entryDisabledMap)) {
-        if (validUidSet.has(uid)) {
-            plan.set(uid, Boolean(nextDisabled));
-        }
+        if (!validUidSet.has(uid)) continue;
+        const gid = bookConfig.assignments[uid];
+        if (gid && sceneGroupIds.has(gid)) continue;
+        plan.set(uid, Boolean(nextDisabled));
     }
 
-    // Prune no-op entries that already match current worldbook state
     const currentByUid = new Map(list.map((e) => [e.uid, Boolean(e.disabled)]));
     for (const [uid, nextDisabled] of [...plan.entries()]) {
         if (currentByUid.get(uid) === nextDisabled) {
@@ -1050,12 +1008,7 @@ export function computeChatProfileRestorePlan(entries, rawBookConfig, rawChatPro
 }
 
 /**
- * Format a group's entry UIDs as a standard greeting automation HTML comment
- * (`<!-- lore: 1,2,3 -->` or `<!-- exclude: 1,2,3 -->`) for 1-click author copy.
- *
- * @param {string[]} uids
- * @param {'lore' | 'exclude'} [tagType='lore']
- * @returns {string}
+ * Format a group's entry UIDs as a standard greeting automation HTML comment.
  */
 export function formatGreetingCommentTag(uids, tagType = 'lore') {
     const nums = [...new Set(
@@ -1068,23 +1021,18 @@ export function formatGreetingCommentTag(uids, tagType = 'lore') {
     return `<!-- ${tag}: ${nums.join(',')} -->`;
 }
 
-/**
- * Infer whether a group title likely represents an IF route / mutually exclusive branch.
- * @param {string} groupName
- * @returns {boolean}
- */
 export function looksLikeIfLineName(groupName) {
     const clean = String(groupName ?? '').trim();
     if (!clean) return false;
     return IF_NAME_HINT_REGEX.test(clean);
 }
 
-/**
- * Extract a candidate group prefix from an entry title.
- *
- * @param {string} rawTitle
- * @returns {string | null}
- */
+export function looksLikeNsfwEntry(titleOrKeys) {
+    const clean = String(titleOrKeys ?? '').trim();
+    if (!clean) return false;
+    return NSFW_TITLE_HINT_REGEX.test(clean);
+}
+
 export function extractEntryTitlePrefix(rawTitle) {
     let text = String(rawTitle ?? '').trim();
     if (!text) return null;
@@ -1115,8 +1063,8 @@ export function extractEntryTitlePrefix(rawTitle) {
 }
 
 /**
- * Detect candidate entry groups automatically using divider banners, title prefixes,
- * or greeting `<!-- lore: ... -->` comment tags.
+ * Detect candidate entry groups automatically using NSFW scene hints, greeting tags,
+ * divider banners, and title prefixes.
  */
 export function detectAutoGroups(entries, {
     strategy = 'smart',
@@ -1129,6 +1077,27 @@ export function detectAutoGroups(entries, {
     const validEntryMap = new Map(list.map((e) => [e.uid, e]));
 
     const isEligible = (uid) => !onlyUngrouped || !assignedObj[uid];
+
+    const detectNsfwSceneGroup = (claimedSet) => {
+        const nsfwUids = [];
+        for (const entry of list) {
+            if (entry.isDivider) continue;
+            if (!isEligible(entry.uid) || claimedSet.has(entry.uid)) continue;
+            const probe = `${entry.rawComment || entry.title} ${(entry.keys || []).join(' ')}`;
+            if (looksLikeNsfwEntry(probe)) {
+                nsfwUids.push(entry.uid);
+            }
+        }
+        if (nsfwUids.length === 0) return [];
+        for (const uid of nsfwUids) claimedSet.add(uid);
+        return [{
+            key: 'scene_nsfw',
+            name: '亲密剧情 (NSFW)',
+            suggestedMode: GROUP_MODES.SCENE,
+            uids: nsfwUids,
+            source: 'scene',
+        }];
+    };
 
     const detectFromGreetings = (claimedSet) => {
         const out = [];
@@ -1157,10 +1126,7 @@ export function detectAutoGroups(entries, {
 
         for (const entry of list) {
             if (entry.isDivider && entry.dividerLabel) {
-                currentBlock = {
-                    label: entry.dividerLabel,
-                    uids: [],
-                };
+                currentBlock = { label: entry.dividerLabel, uids: [] };
                 if (isEligible(entry.uid) && !claimedSet.has(entry.uid)) {
                     currentBlock.uids.push(entry.uid);
                 }
@@ -1186,10 +1152,13 @@ export function detectAutoGroups(entries, {
         for (const [label, uids] of mergedByLabel.entries()) {
             if (uids.length === 0) continue;
             for (const uid of uids) claimedSet.add(uid);
+            const suggestedMode = looksLikeNsfwEntry(label)
+                ? GROUP_MODES.SCENE
+                : (looksLikeIfLineName(label) ? GROUP_MODES.IF_LINE : GROUP_MODES.NORMAL);
             out.push({
                 key: `divider_${idx++}_${label}`,
                 name: label,
-                suggestedMode: looksLikeIfLineName(label) ? GROUP_MODES.IF_LINE : GROUP_MODES.NORMAL,
+                suggestedMode,
                 uids,
                 source: 'divider',
             });
@@ -1211,12 +1180,16 @@ export function detectAutoGroups(entries, {
         const out = [];
         let idx = 0;
         for (const [prefix, uids] of buckets.entries()) {
-            if (uids.length < 2 && !looksLikeIfLineName(prefix)) continue;
+            const isSpecial = looksLikeIfLineName(prefix) || looksLikeNsfwEntry(prefix);
+            if (uids.length < 2 && !isSpecial) continue;
             for (const uid of uids) claimedSet.add(uid);
+            const suggestedMode = looksLikeNsfwEntry(prefix)
+                ? GROUP_MODES.SCENE
+                : (looksLikeIfLineName(prefix) ? GROUP_MODES.IF_LINE : GROUP_MODES.NORMAL);
             out.push({
                 key: `prefix_${idx++}_${prefix}`,
                 name: prefix,
-                suggestedMode: looksLikeIfLineName(prefix) ? GROUP_MODES.IF_LINE : GROUP_MODES.NORMAL,
+                suggestedMode,
                 uids,
                 source: 'prefix',
             });
@@ -1225,11 +1198,13 @@ export function detectAutoGroups(entries, {
     };
 
     const claimed = new Set();
+    if (strategy === 'scene') return detectNsfwSceneGroup(claimed);
     if (strategy === 'greeting') return detectFromGreetings(claimed);
     if (strategy === 'divider') return detectFromDividers(claimed);
     if (strategy === 'prefix') return detectFromPrefixes(claimed);
 
     const results = [];
+    results.push(...detectNsfwSceneGroup(claimed));
     if (greetingIndex?.hasManagedEntries) {
         results.push(...detectFromGreetings(claimed));
     }
@@ -1252,19 +1227,27 @@ export function applyAutoGroupProposals(rawBookConfig, proposals, { replaceExist
         if (!name || uids.length === 0) continue;
 
         const desiredMode = item.mode || item.suggestedMode || GROUP_MODES.NORMAL;
+        const validMode = (
+            desiredMode === GROUP_MODES.IF_LINE ||
+            desiredMode === GROUP_MODES.RADIO ||
+            desiredMode === GROUP_MODES.SCENE
+        )
+            ? desiredMode
+            : GROUP_MODES.NORMAL;
+
         let group = next.groups.find((g) => g.name === name);
         if (!group) {
             group = {
                 id: createGroupId('grp'),
                 name,
-                mode: desiredMode === GROUP_MODES.IF_LINE || desiredMode === GROUP_MODES.RADIO
-                    ? desiredMode
-                    : GROUP_MODES.NORMAL,
+                mode: validMode,
                 collapsed: false,
+                sceneKeywords: [],
+                cooldownTurns: 2,
             };
             next.groups.push(group);
-        } else if (group.mode === GROUP_MODES.NORMAL && desiredMode === GROUP_MODES.IF_LINE) {
-            group.mode = GROUP_MODES.IF_LINE;
+        } else if (group.mode === GROUP_MODES.NORMAL && validMode !== GROUP_MODES.NORMAL) {
+            group.mode = validMode;
         }
 
         for (const uid of uids) {
@@ -1276,12 +1259,7 @@ export function applyAutoGroupProposals(rawBookConfig, proposals, { replaceExist
 }
 
 /**
- * Migrate plugin settings (and per-chat route profiles) when `worldbook-organizer` renames a worldbook.
- *
- * @param {Record<string, any>} settings
- * @param {string} oldName
- * @param {string} newName
- * @returns {boolean}
+ * Migrate plugin settings when `worldbook-organizer` renames a worldbook.
  */
 export function migrateSettingsOnWorldRename(settings, oldName, newName) {
     const cleanOld = String(oldName ?? '').trim();
@@ -1331,11 +1309,7 @@ export function migrateSettingsOnWorldRename(settings, oldName, newName) {
 }
 
 /**
- * Clean up plugin settings (and per-chat route profiles) when worldbooks are deleted.
- *
- * @param {Record<string, any>} settings
- * @param {string[]} deletedNames
- * @returns {boolean}
+ * Clean up plugin settings when worldbooks are deleted.
  */
 export function removeDeletedWorldsFromSettings(settings, deletedNames) {
     if (!settings || !Array.isArray(deletedNames) || deletedNames.length === 0) return false;

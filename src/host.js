@@ -2,24 +2,26 @@
  * Worldbook Entry Groups — Dual-host adapter for SillyTavern & TauriTavern.
  *
  * Key guarantees:
- * 1. Uncached direct reads (`/api/worldinfo/get`) extract lightweight entry summaries
- *    and immediately drop raw JSON payloads so iOS WKWebView never bloats `worldInfoCache`.
- * 2. Batch group / IF-line switches perform a single `/api/worldinfo/edit` write,
- *    preserving 100% of original entry fields while keeping any already-cached active
- *    worldbook and open native editor synchronized.
- * 3. Per-chat save route binding (`chatMetadata` + fallback `chatProfiles`): remembers
- *    which IF line / entry state each chat save uses (even 100+ floors deep or in branched saves)
- *    and restores it automatically on `CHAT_CHANGED`.
+ * 1. Zero chat-history scanning: `CHAT_CHANGED` reads ONLY `chatMetadata` (~200B, O(1)),
+ *    so 100MB+ / multi-thousand-floor chats never incur regex loops or memory spikes.
+ * 2. In-save timeline progression (e.g. 18岁 -> 30岁): switching an IF-line group updates
+ *    the save's `chatMetadata` stage immediately and is never reverted by floor-0 openings.
+ * 3. Pre-WorldInfo scene auto-toggle (`GENERATION_AFTER_COMMANDS`): inspects ONLY the latest
+ *    1–2 turn snippets (~1200 chars max) with a zero-I/O fast path on normal turns, enabling
+ *    `scene` (e.g. NSFW) groups right before `getWorldInfoPrompt` and cooling down automatically.
  */
 
 import {
+    GROUP_MODES,
     MODULE_NAME,
     applyTogglePlanToPayload,
     buildChatProfileFromCurrentState,
     buildGreetingCoordinationIndex,
+    buildInitialProfileFromFloorZero,
     computeChatProfileRestorePlan,
+    computeGroupTogglePlan,
+    evaluateSceneAutoToggle,
     extractWorldbookEntrySummaries,
-    inferChatRouteFromMessages,
     normalizeBookConfig,
     normalizeChatProfile,
     normalizeSettings,
@@ -30,10 +32,11 @@ let _worldInfoModule = null;
 let _worldInfoModuleTried = false;
 let _selfWriteGuardUntil = 0;
 
-/**
- * Return SillyTavern / TauriTavern global context safely.
- * @returns {any | null}
- */
+/** @type {Map<string, Record<string, number>>} chatKey -> (groupId -> remainingCooldownTurns) */
+const _sceneCooldownByChat = new Map();
+/** @type {Map<string, Map<string, boolean>>} worldName -> (uid -> disabled) lightweight state cache */
+const _knownEntryDisabledByBook = new Map();
+
 export function getHostContext() {
     try {
         return globalThis.SillyTavern?.getContext?.() || null;
@@ -42,27 +45,15 @@ export function getHostContext() {
     }
 }
 
-/**
- * Detect whether the extension is running inside TauriTavern.
- * @returns {boolean}
- */
 export function isTauriTavern() {
     return Boolean(globalThis.__TAURITAVERN__ || globalThis.__TAURI_RUNNING__);
 }
 
-/**
- * Apply TauriTavern mobile surface attribute cleanly when applicable.
- * @param {HTMLElement | null} el
- * @param {'fullscreen-window' | 'backdrop' | 'free-window'} surface
- */
 export function applyTauriSurface(el, surface) {
     if (!el || !isTauriTavern()) return;
     el.setAttribute('data-tt-mobile-surface', surface);
 }
 
-/**
- * Wait for TauriTavern host readiness if present (no-op on standard SillyTavern).
- */
 export async function waitForTauriReadyIfPresent() {
     const readyPromise =
         globalThis.__TAURITAVERN__?.ready ??
@@ -77,10 +68,6 @@ export async function waitForTauriReadyIfPresent() {
     }
 }
 
-/**
- * Lazily import `/scripts/world-info.js` once to access authoritative `world_names`
- * and inspect `worldInfoCache` without triggering extra network requests.
- */
 export async function ensureWorldInfoModule() {
     if (_worldInfoModuleTried) return _worldInfoModule;
     _worldInfoModuleTried = true;
@@ -93,9 +80,6 @@ export async function ensureWorldInfoModule() {
     return _worldInfoModule;
 }
 
-/**
- * Build request headers compatible with ST 1.14–1.19+ and TauriTavern.
- */
 function buildRequestHeaders() {
     const ctx = getHostContext();
     if (typeof ctx?.getRequestHeaders === 'function') {
@@ -104,11 +88,6 @@ function buildRequestHeaders() {
     return { 'Content-Type': 'application/json' };
 }
 
-/**
- * Emit a decoupled browser CustomEvent safely (no-op in Node test environments).
- * @param {string} type
- * @param {Record<string, any>} [detail]
- */
 export function emitBridgeEvent(type, detail = {}) {
     try {
         if (typeof window !== 'undefined' && typeof CustomEvent === 'function') {
@@ -119,10 +98,6 @@ export function emitBridgeEvent(type, detail = {}) {
     }
 }
 
-/**
- * Read and normalize persisted extension settings in place.
- * @returns {Record<string, any>}
- */
 export function getSettings() {
     const ctx = getHostContext();
     const fallbackRoot = globalThis.extension_settings;
@@ -139,9 +114,6 @@ export function getSettings() {
     return container[MODULE_NAME];
 }
 
-/**
- * Persist extension settings via host debounced saver.
- */
 export function saveSettings() {
     const ctx = getHostContext();
     if (typeof ctx?.saveSettingsDebounced === 'function') {
@@ -150,18 +122,31 @@ export function saveSettings() {
     emitBridgeEvent('weg:settings-updated', { reason: 'save' });
 }
 
-/**
- * Check whether a recent write came from this extension itself (prevents echo loops).
- * @returns {boolean}
- */
 export function isWithinSelfWriteWindow() {
     return Date.now() < _selfWriteGuardUntil;
 }
 
-/**
- * Return the authoritative list of worldbook names from host memory (never resurrects deleted DOM options).
- * @returns {string[]}
- */
+function cacheLightDisabledSnapshot(worldName, summaries) {
+    if (!worldName || !Array.isArray(summaries)) return;
+    if (_knownEntryDisabledByBook.size > 12 && !_knownEntryDisabledByBook.has(worldName)) {
+        const oldest = _knownEntryDisabledByBook.keys().next().value;
+        if (oldest !== undefined) _knownEntryDisabledByBook.delete(oldest);
+    }
+    _knownEntryDisabledByBook.set(
+        worldName,
+        new Map(summaries.map((s) => [s.uid, Boolean(s.disabled)])),
+    );
+}
+
+export function clearRuntimeBookSnapshots(worldName = '') {
+    if (worldName) {
+        _knownEntryDisabledByBook.delete(worldName);
+    } else {
+        _knownEntryDisabledByBook.clear();
+        _sceneCooldownByChat.clear();
+    }
+}
+
 export function getWorldNames() {
     const ctx = getHostContext();
     let rawList = [];
@@ -202,10 +187,6 @@ export function getWorldNames() {
     return cleanList;
 }
 
-/**
- * Return the worldbook currently open in SillyTavern's native editor, if any.
- * @returns {string | null}
- */
 export function getCurrentEditorWorldName() {
     if (typeof document === 'undefined') return null;
     const sel = document.getElementById('world_editor_select');
@@ -215,10 +196,6 @@ export function getCurrentEditorWorldName() {
     return (selectedOpt.textContent || '').trim() || null;
 }
 
-/**
- * Return the current active chat character's primary worldbook (or chat-bound worldbook).
- * @returns {string | null}
- */
 export function getCurrentCharacterPrimaryWorldName() {
     try {
         const thPrimary = globalThis.TavernHelper?.getCurrentCharPrimaryLorebook?.();
@@ -226,7 +203,7 @@ export function getCurrentCharacterPrimaryWorldName() {
             return thPrimary.trim();
         }
     } catch {
-        // Ignore if TavernHelper is absent or not ready
+        // Ignore
     }
 
     const ctx = getHostContext();
@@ -253,8 +230,7 @@ export function getCurrentCharacterPrimaryWorldName() {
 }
 
 /**
- * Return identity & primary worldbook metadata for the currently open chat save, if any.
- * @returns {{ chatId: string, chatKey: string, characterName: string, primaryWorldName: string, floorCount: number } | null}
+ * O(1) chat identity lookup — reads ONLY lightweight scalar properties, NEVER iterates `ctx.chat`.
  */
 export function getCurrentChatSaveContext() {
     const ctx = getHostContext();
@@ -301,10 +277,7 @@ export function getCurrentChatSaveContext() {
 }
 
 /**
- * Read the bound route profile for the currently active chat save (if any).
- * Checks per-chat `chatMetadata.worldbook_entry_groups` first, falling back to `settings.chatProfiles[chatKey]`.
- *
- * @param {string} [expectedWorldName]
+ * O(1) read of the bound route profile for the active chat save.
  */
 export function getActiveChatBoundProfile(expectedWorldName = '') {
     const saveCtx = getCurrentChatSaveContext();
@@ -326,11 +299,7 @@ export function getActiveChatBoundProfile(expectedWorldName = '') {
 }
 
 /**
- * Persist a route profile into BOTH the active chat's `.jsonl` `chatMetadata` AND `settings.chatProfiles`.
- * Pass `null` to unbind the active chat save.
- *
- * @param {any | null} rawProfile
- * @returns {boolean}
+ * Persist a route profile into BOTH `chatMetadata` AND `settings.chatProfiles`.
  */
 export function saveActiveChatBoundProfile(rawProfile) {
     const saveCtx = getCurrentChatSaveContext();
@@ -358,12 +327,6 @@ export function saveActiveChatBoundProfile(rawProfile) {
     return true;
 }
 
-/**
- * Pick the most helpful initial worldbook when opening the panel.
- *
- * @param {Record<string, any>} settings
- * @returns {string}
- */
 export function getPreferredDefaultBook(settings) {
     const names = getWorldNames();
     if (names.length === 0) return '';
@@ -381,13 +344,6 @@ export function getPreferredDefaultBook(settings) {
     return names[0];
 }
 
-/**
- * Read raw worldbook JSON directly from `/api/worldinfo/get` WITHOUT populating
- * SillyTavern's persistent `worldInfoCache` (prevents mobile WebView OOM).
- *
- * @param {string} worldName
- * @returns {Promise<any | null>}
- */
 async function fetchWorldInfoUncached(worldName) {
     const clean = String(worldName ?? '').trim();
     if (!clean) return null;
@@ -402,7 +358,7 @@ async function fetchWorldInfoUncached(worldName) {
             return await res.json();
         }
     } catch {
-        // Fallback below only if host customizes worldinfo loading
+        // Fallback below
     }
 
     try {
@@ -418,12 +374,6 @@ async function fetchWorldInfoUncached(worldName) {
     return null;
 }
 
-/**
- * Read a single worldbook's lightweight entry summaries without retaining `content` in memory.
- *
- * @param {string} worldName
- * @returns {Promise<{ ok: boolean, summaries: Array<any>, error?: string }>}
- */
 export async function loadWorldbookSummariesUncached(worldName) {
     const clean = String(worldName ?? '').trim();
     if (!clean) return { ok: false, summaries: [], error: '未选择世界书' };
@@ -435,18 +385,11 @@ export async function loadWorldbookSummariesUncached(worldName) {
 
     const summaries = extractWorldbookEntrySummaries(payload);
     payload = null;
+    cacheLightDisabledSnapshot(clean, summaries);
 
     return { ok: true, summaries };
 }
 
-/**
- * Sync SillyTavern's already-cached `worldInfoCache` entry (if and ONLY if already cached!)
- * and refresh `#world_popup_entries_list` if this worldbook is currently open in the native editor.
- *
- * @param {string} worldName
- * @param {any} updatedPayload
- * @param {Array<{ uid: string, disabled: boolean }>} appliedChanges
- */
 async function syncHostCacheAndOpenEditorIfPresent(worldName, updatedPayload, appliedChanges) {
     await ensureWorldInfoModule();
     const cache = _worldInfoModule?.worldInfoCache;
@@ -498,14 +441,6 @@ async function syncHostCacheAndOpenEditorIfPresent(worldName, updatedPayload, ap
     }
 }
 
-/**
- * Apply a batch toggle plan (`Map<uid, nextDisabled>`) to a worldbook in ONE single disk write.
- * Always reads the freshest payload right before applying so external changes are never overwritten.
- *
- * @param {string} worldName
- * @param {Map<string, boolean>} togglePlan
- * @returns {Promise<{ ok: boolean, changedCount: number, appliedChanges: Array<{ uid: string, disabled: boolean }>, summaries: Array<any>, error?: string }>}
- */
 export async function applyWorldbookTogglePlan(worldName, togglePlan) {
     const clean = String(worldName ?? '').trim();
     if (!clean) {
@@ -521,6 +456,7 @@ export async function applyWorldbookTogglePlan(worldName, togglePlan) {
     if (changedCount === 0) {
         const summaries = extractWorldbookEntrySummaries(payload);
         payload = null;
+        cacheLightDisabledSnapshot(clean, summaries);
         return { ok: true, changedCount: 0, appliedChanges: [], summaries };
     }
 
@@ -550,6 +486,7 @@ export async function applyWorldbookTogglePlan(worldName, togglePlan) {
 
     const summaries = extractWorldbookEntrySummaries(payload);
     payload = null;
+    cacheLightDisabledSnapshot(clean, summaries);
 
     emitBridgeEvent('weg:entries-toggled', {
         worldName: clean,
@@ -565,15 +502,6 @@ export async function applyWorldbookTogglePlan(worldName, togglePlan) {
     };
 }
 
-/**
- * Resolve greeting comment coordination (`<!-- lore / exclude / title -->`) for the character
- * bound to `worldName`, ALWAYS combining full character-card greetings with live floor-0 swipes
- * so multi-floor or branched chats never lose sibling IF-line UID sets!
- *
- * @param {string} worldName
- * @param {{ allowFetchShallow?: boolean }} [opts]
- * @returns {Promise<{ characterName: string, greetingIndex: ReturnType<typeof buildGreetingCoordinationIndex> | null }>}
- */
 export async function resolveGreetingCoordinationForBook(worldName, { allowFetchShallow = false } = {}) {
     const clean = String(worldName ?? '').trim();
     if (!clean) return { characterName: '', greetingIndex: null };
@@ -655,14 +583,10 @@ export async function resolveGreetingCoordinationForBook(worldName, { allowFetch
 }
 
 /**
- * Automatically recognize & restore the active chat save's IF-line / entry state!
- * - On `floor0-swipe` (when `chat.length === 1`): updates this save's bound route to match the newly chosen greeting.
- * - On `chat-changed` (even 100+ floors deep or in `/branch` saves): uses the save's bound `chatMetadata` profile,
- *   or infers the route from `ctx.chat` messages + character card greetings, binds it, and restores the worldbook
- *   in a single write if any entry differs!
- *
- * @param {{ reason?: 'chat-changed' | 'floor0-swipe' | 'manual', silentToast?: boolean }} [opts]
- * @returns {Promise<{ synced: boolean, changedCount: number, routeLabel: string, worldName: string }>}
+ * Pure O(1) metadata-driven save route restoration!
+ * - NEVER scans or iterates multi-floor chat history (100% safe on 500MB+ chat files).
+ * - Only inspects `chat[0]` header (~1.2KB slice) when `chat.length === 1` (freshly created 1-message save).
+ * - Once bound in `chatMetadata` (e.g. `18岁线`, or later switched to `30岁线` mid-save), restores `chatMetadata` directly!
  */
 export async function syncWorldbookForActiveChat({ reason = 'chat-changed', silentToast = false } = {}) {
     const settings = getSettings();
@@ -678,24 +602,23 @@ export async function syncWorldbookForActiveChat({ reason = 'chat-changed', sile
 
     const worldName = saveCtx.primaryWorldName;
     const bookConfig = normalizeBookConfig(settings.books?.[worldName]);
-    const chatMessages = Array.isArray(ctx.chat) ? ctx.chat : [];
-
     let { profile } = getActiveChatBoundProfile(worldName);
 
-    // When swiping floor 0 on a brand-new 1-message chat, re-infer route from the new greeting!
-    const isFreshFloorZeroSwipe = reason === 'floor0-swipe' && chatMessages.length <= 1;
-
-    if (!profile || isFreshFloorZeroSwipe) {
-        const { greetingIndex } = await resolveGreetingCoordinationForBook(worldName, { allowFetchShallow: false });
-        const inferred = inferChatRouteFromMessages({
-            worldName,
-            chatMessages,
-            greetingIndex,
-            bookConfig,
-        });
-        if (inferred) {
-            profile = inferred;
-            saveActiveChatBoundProfile(profile);
+    // ONLY inspect floor 0 header when the chat is a brand-new 1-floor opening (`floorCount === 1`)!
+    if (saveCtx.floorCount === 1 && (!profile || reason === 'floor0-swipe')) {
+        const floorZeroHeader = String(ctx.chat?.[0]?.mes ?? '').slice(0, 1200);
+        if (floorZeroHeader.includes('<!--')) {
+            const { greetingIndex } = await resolveGreetingCoordinationForBook(worldName, { allowFetchShallow: false });
+            const initial = buildInitialProfileFromFloorZero({
+                worldName,
+                floorZeroMes: floorZeroHeader,
+                greetingIndex,
+                bookConfig,
+            });
+            if (initial) {
+                profile = initial;
+                saveActiveChatBoundProfile(profile);
+            }
         }
     }
 
@@ -715,7 +638,7 @@ export async function syncWorldbookForActiveChat({ reason = 'chat-changed', sile
 
     const writeRes = await applyWorldbookTogglePlan(worldName, restorePlan);
     if (writeRes.ok && writeRes.changedCount > 0 && !silentToast) {
-        showToast('info', `已按当前存档切换至「${profile.routeLabel}」（同步 ${writeRes.changedCount} 个条目）`);
+        showToast('info', `已按当前存档切换至「${profile.routeLabel}」`);
     }
 
     return {
@@ -727,13 +650,134 @@ export async function syncWorldbookForActiveChat({ reason = 'chat-changed', sile
 }
 
 /**
- * Capture and bind the worldbook's current IF-line / entry state to the active chat save
- * whenever `worldName` matches the active chat's primary worldbook.
+ * Switch a named group (e.g. `/weg 30岁线`) directly in the active character's primary worldbook
+ * and update the active chat save's stage binding (supports instant 18岁 -> 30岁 mid-save jump!).
  *
- * @param {string} worldName
- * @param {Array<any>} summaries
- * @param {{ preferredIfGroupId?: string, customLabel?: string, greetingIndex?: any, force?: boolean }} [opts]
+ * @param {string} groupNameQuery
+ * @returns {Promise<{ matched: boolean, groupName?: string, error?: string }>}
  */
+export async function switchNamedGroupInActiveChat(groupNameQuery) {
+    const query = String(groupNameQuery ?? '').trim();
+    if (!query) return { matched: false };
+
+    const worldName = getCurrentCharacterPrimaryWorldName();
+    if (!worldName) return { matched: false };
+
+    const settings = getSettings();
+    const bookCfg = normalizeBookConfig(settings.books?.[worldName]);
+    if (bookCfg.groups.length === 0) return { matched: false };
+
+    const targetGrp = bookCfg.groups.find((g) => g.name === query)
+        || bookCfg.groups.find((g) => g.name.toLowerCase() === query.toLowerCase());
+    if (!targetGrp) return { matched: false };
+
+    const readRes = await loadWorldbookSummariesUncached(worldName);
+    if (!readRes.ok) return { matched: true, groupName: targetGrp.name, error: readRes.error };
+
+    const plan = computeGroupTogglePlan(readRes.summaries, bookCfg, targetGrp.id, true);
+    let latestSummaries = readRes.summaries;
+    if (plan.size > 0) {
+        const writeRes = await applyWorldbookTogglePlan(worldName, plan);
+        if (!writeRes.ok) return { matched: true, groupName: targetGrp.name, error: writeRes.error };
+        latestSummaries = writeRes.summaries;
+    }
+
+    recordStateIntoActiveChatIfMatching(worldName, latestSummaries, {
+        preferredIfGroupId: targetGrp.mode === GROUP_MODES.IF_LINE ? targetGrp.id : '',
+        customLabel: targetGrp.name,
+        force: true,
+    });
+
+    showToast('success', `已切换本档至「${targetGrp.name}」`);
+    return { matched: true, groupName: targetGrp.name };
+}
+
+/**
+ * Pre-WorldInfo generation hook (`GENERATION_AFTER_COMMANDS`):
+ * Automatically enables `scene` groups (e.g. NSFW lore) right before SillyTavern calls
+ * `getWorldInfoPrompt()` when recent dialogue hits scene cues, and automatically turns them
+ * back OFF once the conversation returns to normal plot!
+ *
+ * Fast-path: 0ms & 0 I/O when no `scene` groups exist or when state requires no transition!
+ */
+export async function syncSceneGroupsBeforeGeneration(type, dryRun = false) {
+    if (dryRun || type === 'quiet') return { changedCount: 0 };
+
+    const settings = getSettings();
+    if (settings.enableSceneAutoToggle === false) return { changedCount: 0 };
+
+    const ctx = getHostContext();
+    const saveCtx = getCurrentChatSaveContext();
+    if (!ctx || !saveCtx || !saveCtx.primaryWorldName) return { changedCount: 0 };
+
+    const worldName = saveCtx.primaryWorldName;
+    const bookConfig = normalizeBookConfig(settings.books?.[worldName]);
+    if (!bookConfig.groups.some((g) => g.mode === GROUP_MODES.SCENE)) {
+        return { changedCount: 0 };
+    }
+
+    // Read ONLY the tail ~600 chars of the latest 2 messages (never touches earlier chat history!)
+    const chatArr = Array.isArray(ctx.chat) ? ctx.chat : [];
+    const tailCount = Math.min(2, chatArr.length);
+    const snippets = [];
+    for (let i = chatArr.length - tailCount; i < chatArr.length; i += 1) {
+        const raw = String(chatArr[i]?.mes ?? '');
+        if (raw) snippets.push(raw.slice(-600));
+    }
+    const recentText = snippets.join('\n');
+
+    // Use lightweight in-memory disabled snapshot (or `worldInfoCache`) first to avoid `fetch` on idle turns!
+    await ensureWorldInfoModule();
+    let probeEntries = null;
+    const hostCache = _worldInfoModule?.worldInfoCache;
+    if (hostCache instanceof Map && hostCache.has(worldName)) {
+        const cachedPayload = hostCache.get(worldName);
+        if (cachedPayload?.entries) {
+            probeEntries = Object.entries(cachedPayload.entries).map(([k, e]) => ({
+                uid: String(e?.uid ?? k),
+                disabled: Boolean(e?.disable),
+            }));
+        }
+    } else if (_knownEntryDisabledByBook.has(worldName)) {
+        const knownMap = _knownEntryDisabledByBook.get(worldName);
+        probeEntries = [...knownMap.entries()].map(([uid, disabled]) => ({ uid, disabled }));
+    }
+
+    if (!probeEntries) {
+        const readRes = await loadWorldbookSummariesUncached(worldName);
+        if (!readRes.ok) return { changedCount: 0 };
+        probeEntries = readRes.summaries;
+    }
+
+    const prevCooldown = _sceneCooldownByChat.get(saveCtx.chatKey) || {};
+    const evalRes = evaluateSceneAutoToggle({
+        entries: probeEntries,
+        bookConfig,
+        recentText,
+        cooldownByGroupId: prevCooldown,
+    });
+    _sceneCooldownByChat.set(saveCtx.chatKey, evalRes.nextCooldownByGroupId);
+
+    if (evalRes.togglePlan.size === 0) {
+        return { changedCount: 0 };
+    }
+
+    const writeRes = await applyWorldbookTogglePlan(worldName, evalRes.togglePlan);
+    if (writeRes.ok && writeRes.changedCount > 0) {
+        if (evalRes.activatedGroups.length > 0) {
+            showToast('info', `检测到剧情信号，已临时开启「${evalRes.activatedGroups.join('、')}」`);
+        } else if (evalRes.deactivatedGroups.length > 0) {
+            showToast('info', `剧情已恢复日常，已自动收起「${evalRes.deactivatedGroups.join('、')}」`);
+        }
+    }
+
+    return {
+        changedCount: writeRes.changedCount || 0,
+        activatedGroups: evalRes.activatedGroups,
+        deactivatedGroups: evalRes.deactivatedGroups,
+    };
+}
+
 export function recordStateIntoActiveChatIfMatching(worldName, summaries, opts = {}) {
     const cleanWorld = String(worldName ?? '').trim();
     if (!cleanWorld) return null;
@@ -752,14 +796,6 @@ export function recordStateIntoActiveChatIfMatching(worldName, summaries, opts =
     return profile;
 }
 
-/**
- * Open `worldName` in SillyTavern's native `#WorldInfo` editor and scroll + highlight `uid`.
- *
- * @param {string} worldName
- * @param {string} uid
- * @param {string} [entryTitle='']
- * @returns {Promise<boolean>}
- */
 export async function locateEntryInNativeEditor(worldName, uid, entryTitle = '') {
     const cleanWorld = String(worldName ?? '').trim();
     const uidStr = String(uid ?? '').trim();
@@ -866,11 +902,6 @@ export async function locateEntryInNativeEditor(worldName, uid, entryTitle = '')
     });
 }
 
-/**
- * Copy plain text to clipboard with fallback for restricted WebViews.
- * @param {string} text
- * @returns {Promise<boolean>}
- */
 export async function copyTextToClipboard(text) {
     const content = String(text ?? '');
     if (!content) return false;
@@ -899,10 +930,6 @@ export async function copyTextToClipboard(text) {
     }
 }
 
-/**
- * Detect whether the active SillyTavern theme background is light or dark.
- * @returns {'light' | 'dark'}
- */
 export function detectHostColorScheme() {
     if (typeof document === 'undefined' || typeof getComputedStyle !== 'function') return 'dark';
     try {
@@ -926,11 +953,6 @@ export function detectHostColorScheme() {
     return 'dark';
 }
 
-/**
- * Display a concise toast message.
- * @param {'success' | 'info' | 'warning' | 'error'} type
- * @param {string} message
- */
 export function showToast(type, message) {
     const toastr = globalThis.toastr;
     if (toastr && typeof toastr[type] === 'function') {

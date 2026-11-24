@@ -2,12 +2,11 @@
  * Worldbook Entry Groups — Entry module for SillyTavern & TauriTavern.
  *
  * Lifecycle guarantees:
- * - Zero polling & zero background worldbook scanning.
- * - Per-chat save route recognition & auto-switching (`CHAT_CHANGED` + floor-0 `MESSAGE_SWIPED`):
- *   runs after external floor-0 scripts settle so multi-floor & branched chat saves always
- *   restore their true IF-line / entry state cleanly.
- * - Coordinates with companion `worldbook-organizer` (`wbo:worldbook-renamed` / `wbo:worldbook-deleted`).
- * - Deterministic cleanup (`onDisable` / `onClean`) removes all listeners, observers, and DOM mounts.
+ * - Zero polling, zero background worldbook scanning, zero multi-floor chat history scanning.
+ * - Mounts in 3 native places: Extensions Drawer (`#extensions_settings2`), Magic Wand Menu (`#extensionsMenu`),
+ *   and WorldInfo Toolbar (`#world_popup`).
+ * - O(1) metadata-based per-chat route restoration on `CHAT_CHANGED` + pre-WorldInfo scene auto-toggle
+ *   on `GENERATION_AFTER_COMMANDS`.
  */
 
 import {
@@ -15,29 +14,32 @@ import {
     removeDeletedWorldsFromSettings,
 } from './src/core.js';
 import {
+    clearRuntimeBookSnapshots,
     ensureWorldInfoModule,
     getCurrentCharacterPrimaryWorldName,
     getHostContext,
     getSettings,
     isWithinSelfWriteWindow,
     saveSettings,
+    switchNamedGroupInActiveChat,
+    syncSceneGroupsBeforeGeneration,
     syncWorldbookForActiveChat,
     waitForTauriReadyIfPresent,
 } from './src/host.js';
 import {
     bindPanelCallbacks,
-    ensureNativeShortcutButton,
+    ensureAllNativeEntryPoints,
     getCurrentModalWorldName,
     handleExternalWorldbookDeleted,
     handleExternalWorldbookRenamed,
     isEntryGroupsModalOpen,
     openEntryGroupsModal,
     refreshOpenModalBook,
-    syncNativeShortcutButton,
+    syncAllNativeEntryPoints,
     teardownPanels,
 } from './src/panel.js';
 
-const STYLE_ASSET_VERSION = '0.2.0';
+const STYLE_ASSET_VERSION = '0.3.0';
 
 let _initialized = false;
 let _nativeMountObserver = null;
@@ -49,9 +51,6 @@ let _onWboRenamed = null;
 let _onWboDeleted = null;
 let _onWegOpenPanel = null;
 
-/**
- * Bust stale browser/WebView disk cache on `style.css` after updates without FOUC.
- */
 function ensureFreshStylesheet() {
     if (typeof document === 'undefined' || !document.head) return;
     try {
@@ -73,26 +72,16 @@ function ensureFreshStylesheet() {
         });
         document.head.appendChild(fresh);
     } catch {
-        // Ignore in restricted or test runtimes
+        // Ignore
     }
 }
 
-/**
- * Subscribe safely to host `eventSource` with deterministic teardown tracking.
- * @param {any} eventSource
- * @param {string | undefined} eventName
- * @param {Function} handler
- */
 function trackHostEvent(eventSource, eventName, handler) {
     if (!eventSource || !eventName || typeof eventSource.on !== 'function') return;
     eventSource.on(eventName, handler);
     _boundHostEvents.push({ event: eventName, handler });
 }
 
-/**
- * Debounced refresh for open modal when worldbook state is modified externally.
- * @param {number} [delayMs=480]
- */
 function scheduleOpenModalSync(delayMs = 480) {
     if (!isEntryGroupsModalOpen()) return;
 
@@ -110,14 +99,6 @@ function scheduleOpenModalSync(delayMs = 480) {
     }, delayMs);
 }
 
-/**
- * Debounced per-chat save route recognition & worldbook switch.
- * Runs at ~650ms on `CHAT_CHANGED` (deliberately AFTER floor-0 scripts' 300ms timer!)
- * so multi-floor or branched saves never stay stuck on another save's IF line.
- *
- * @param {'chat-changed' | 'floor0-swipe'} reason
- * @param {number} delayMs
- */
 function scheduleChatSaveRouteSync(reason, delayMs) {
     clearTimeout(_chatSwitchSyncTimer);
     _chatSwitchSyncTimer = setTimeout(async () => {
@@ -125,6 +106,7 @@ function scheduleChatSaveRouteSync(reason, delayMs) {
         if (!_initialized) return;
         const settings = getSettings();
         if (settings.autoSwitchOnChatChange === false) {
+            syncAllNativeEntryPoints();
             if (isEntryGroupsModalOpen()) {
                 void refreshOpenModalBook({ silent: true, reason });
             }
@@ -136,16 +118,14 @@ function scheduleChatSaveRouteSync(reason, delayMs) {
             silentToast: reason === 'floor0-swipe',
         });
 
-        if (_initialized && isEntryGroupsModalOpen()) {
+        if (!_initialized) return;
+        syncAllNativeEntryPoints();
+        if (isEntryGroupsModalOpen()) {
             void refreshOpenModalBook({ silent: true, reason });
         }
     }, delayMs);
 }
 
-/**
- * Watch `#WorldInfo` / `#world_popup` lightly so if the host lazily mounts the WorldInfo toolbar,
- * our shortcut button attaches cleanly with zero polling.
- */
 function startToolbarMountObserver() {
     if (_nativeMountObserver || typeof MutationObserver === 'undefined' || typeof document === 'undefined') return;
     const target = document.getElementById('WorldInfo') || document.getElementById('world_popup');
@@ -153,15 +133,18 @@ function startToolbarMountObserver() {
 
     _nativeMountObserver = new MutationObserver(() => {
         if (!document.getElementById('weg-native-entry-btn')) {
-            ensureNativeShortcutButton();
-            syncNativeShortcutButton();
+            ensureAllNativeEntryPoints();
+            syncAllNativeEntryPoints();
         }
     });
     _nativeMountObserver.observe(target, { childList: true, subtree: true });
 }
 
 /**
- * Register `/weg [worldName]` slash command when `SlashCommandParser` is available.
+ * Register `/weg [分组名 | 世界书名称]` slash command:
+ * - `/weg` -> opens panel
+ * - `/weg 30岁线` -> if matching a group in active character's primary worldbook, directly switches & locks stage!
+ * - `/weg 世界书名` -> opens that worldbook in panel
  */
 function registerSlashCommand(ctx) {
     try {
@@ -172,28 +155,37 @@ function registerSlashCommand(ctx) {
             SlashCommand.fromProps({
                 name: 'weg',
                 callback: async (_namedArgs, unnamedArgs) => {
-                    const worldName = String(unnamedArgs ?? '').trim();
-                    await openEntryGroupsModal(worldName ? { worldName } : {});
-                    return worldName || 'opened';
+                    const arg = String(unnamedArgs ?? '').trim();
+                    if (!arg) {
+                        await openEntryGroupsModal();
+                        return 'opened';
+                    }
+                    const switched = await switchNamedGroupInActiveChat(arg);
+                    if (switched.matched) {
+                        syncAllNativeEntryPoints();
+                        if (isEntryGroupsModalOpen()) {
+                            void refreshOpenModalBook({ silent: true, reason: 'slash-switch' });
+                        }
+                        return switched.groupName || arg;
+                    }
+                    await openEntryGroupsModal({ worldName: arg });
+                    return arg;
                 },
                 unnamedArgumentList: SlashCommandArgument && ARGUMENT_TYPE ? [
                     SlashCommandArgument.fromProps({
-                        description: '可选：指定要打开的世界书名称',
+                        description: '可选：分组名称（直接切换本档路线，如 30岁线）或世界书名称',
                         typeList: [ARGUMENT_TYPE.STRING],
                         isRequired: false,
                     }),
                 ] : [],
-                helpString: '打开世界书条目分组面板：/weg [世界书名称]',
+                helpString: '打开世界书条目分组面板，或直接切换本档分组路线：/weg [分组名|世界书名称]',
             }),
         );
     } catch {
-        // Non-fatal across older ST builds
+        // Non-fatal
     }
 }
 
-/**
- * Idempotent initialization routine.
- */
 export async function init() {
     if (_initialized) return;
     _initialized = true;
@@ -211,21 +203,21 @@ export async function init() {
     bindPanelCallbacks({
         onSettingsChanged: () => {
             saveSettings();
-            syncNativeShortcutButton();
+            syncAllNativeEntryPoints();
         },
     });
 
-    ensureNativeShortcutButton();
-    syncNativeShortcutButton();
+    ensureAllNativeEntryPoints();
+    syncAllNativeEntryPoints();
     startToolbarMountObserver();
 
-    // Cross-plugin CustomEvent bridge (`INTEGRATION.md`)
     if (typeof window !== 'undefined') {
         if (!_onWboRenamed) {
             _onWboRenamed = (ev) => {
                 const oldName = String(ev?.detail?.oldName ?? '').trim();
                 const newName = String(ev?.detail?.newName ?? '').trim();
                 if (!oldName || !newName) return;
+                clearRuntimeBookSnapshots(oldName);
                 const settings = getSettings();
                 if (migrateSettingsOnWorldRename(settings, oldName, newName)) {
                     saveSettings();
@@ -239,6 +231,7 @@ export async function init() {
             _onWboDeleted = (ev) => {
                 const names = Array.isArray(ev?.detail?.names) ? ev.detail.names : [];
                 if (names.length === 0) return;
+                for (const n of names) clearRuntimeBookSnapshots(String(n ?? '').trim());
                 const settings = getSettings();
                 if (removeDeletedWorldsFromSettings(settings, names)) {
                     saveSettings();
@@ -260,11 +253,11 @@ export async function init() {
     const eventSource = ctx.eventSource;
     const et = ctx.eventTypes || ctx.event_types || {};
 
-    const syncToolbarIdle = () => {
+    const syncEntryPointsIdle = () => {
         const run = () => {
             if (!_initialized) return;
-            ensureNativeShortcutButton();
-            syncNativeShortcutButton();
+            ensureAllNativeEntryPoints();
+            syncAllNativeEntryPoints();
         };
         if (typeof globalThis.requestIdleCallback === 'function') {
             globalThis.requestIdleCallback(run, { timeout: 1000 });
@@ -273,16 +266,17 @@ export async function init() {
         }
     };
 
-    trackHostEvent(eventSource, et.APP_READY, syncToolbarIdle);
-    trackHostEvent(eventSource, et.EXTENSION_SETTINGS_LOADED, syncToolbarIdle);
+    trackHostEvent(eventSource, et.APP_READY, syncEntryPointsIdle);
+    trackHostEvent(eventSource, et.EXTENSION_SETTINGS_LOADED, syncEntryPointsIdle);
     trackHostEvent(eventSource, et.WORLDINFO_SETTINGS_UPDATED, () => {
-        syncToolbarIdle();
+        syncEntryPointsIdle();
         if (isEntryGroupsModalOpen() && !isWithinSelfWriteWindow()) {
             scheduleOpenModalSync(380);
         }
     });
-    trackHostEvent(eventSource, et.WORLDINFO_ENTRIES_LOADED, syncToolbarIdle);
+    trackHostEvent(eventSource, et.WORLDINFO_ENTRIES_LOADED, syncEntryPointsIdle);
     trackHostEvent(eventSource, et.WORLDINFO_UPDATED, (worldName) => {
+        if (worldName) clearRuntimeBookSnapshots(String(worldName).trim());
         if (!isEntryGroupsModalOpen() || isWithinSelfWriteWindow()) return;
         const openBook = getCurrentModalWorldName();
         if (!worldName || String(worldName).trim() === openBook) {
@@ -290,7 +284,6 @@ export async function init() {
         }
     });
 
-    // Floor-0 greeting swipe: record newly picked route for a fresh 1-message save & sync modal
     trackHostEvent(eventSource, et.MESSAGE_SWIPED, (msgId) => {
         if (Number(msgId) === 0 || msgId === undefined) {
             scheduleChatSaveRouteSync('floor0-swipe', 520);
@@ -302,10 +295,18 @@ export async function init() {
         }
     });
 
-    // Chat save switch (`CHAT_CHANGED`): restore this save's bound or inferred IF-line state!
+    // O(1) metadata restore when switching chat saves (`CHAT_CHANGED`)
     trackHostEvent(eventSource, et.CHAT_CHANGED, () => {
-        syncToolbarIdle();
+        syncEntryPointsIdle();
         scheduleChatSaveRouteSync('chat-changed', 650);
+    });
+
+    // Awaited pre-WorldInfo hook: turns `scene` (NSFW) groups ON/OFF right before prompt assembly!
+    trackHostEvent(eventSource, et.GENERATION_AFTER_COMMANDS, async (type, _opts, dryRun) => {
+        const res = await syncSceneGroupsBeforeGeneration(type, Boolean(dryRun));
+        if (res.changedCount > 0 && isEntryGroupsModalOpen()) {
+            void refreshOpenModalBook({ silent: true, reason: 'scene-auto' });
+        }
     });
 
     registerSlashCommand(ctx);
@@ -316,9 +317,6 @@ export async function onActivate() {
     await init();
 }
 
-/**
- * Deterministic cleanup on extension disable or uninstall.
- */
 export function onDisable() {
     clearTimeout(_greetingSyncTimer);
     _greetingSyncTimer = null;
@@ -361,6 +359,7 @@ export function onDisable() {
     }
     _boundHostEvents.length = 0;
 
+    clearRuntimeBookSnapshots();
     teardownPanels();
     _initialized = false;
 }
