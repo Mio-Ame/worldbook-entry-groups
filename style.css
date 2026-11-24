@@ -1,0 +1,1310 @@
+/* Worldbook Entry Groups — Minimalist low-saturation solid-surface modal + theme-following native button */
+
+.weg-modal-backdrop[hidden],
+.weg-modal [hidden],
+.weg-submodal-host[hidden] {
+    display: none !important;
+}
+
+/* Native toolbar shortcut button inside `#world_popup`: follows active SillyTavern theme seamlessly */
+#weg-native-entry-btn.weg-native-entry-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    box-sizing: border-box;
+    margin: 0;
+    flex-shrink: 0;
+    cursor: pointer;
+}
+
+/* Gentle highlight flash when locating an entry inside SillyTavern's native `#world_popup_entries_list` */
+@keyframes weg-locate-pulse {
+    0% {
+        box-shadow: 0 0 0 2px var(--SmartThemeQuoteColor, #7a9a83);
+        background-color: rgba(122, 154, 131, 0.18);
+    }
+    100% {
+        box-shadow: 0 0 0 0 transparent;
+        background-color: transparent;
+    }
+}
+
+.world_entry.weg-entry-locate-flash {
+    animation: weg-locate-pulse 1.9s ease-out;
+    border-radius: 6px;
+}
+
+/* ==========================================================================
+   Theme Tokens — Default Palette: 素雅纸墨 (Paper & Graphite Ink)
+   ========================================================================== */
+.weg-modal,
+.weg-floating-menu {
+    --weg-bg: #191a1d;
+    --weg-bg-elevated: #212226;
+    --weg-surface: #24252a;
+    --weg-surface-hover: #2d2f36;
+    --weg-surface-active: #353840;
+    --weg-fg: #e7e7e4;
+    --weg-fg-muted: #9a9b9f;
+    --weg-border: #32343a;
+    --weg-border-strong: #4a4d56;
+    --weg-accent: #dcdcd8;
+    --weg-accent-hover: #efefe9;
+    --weg-accent-fg: #18191c;
+    --weg-accent-soft: rgba(220, 220, 216, 0.13);
+    --weg-if-accent: #7da89b;
+    --weg-if-soft: rgba(125, 168, 155, 0.15);
+    --weg-danger: #d4716a;
+    --weg-danger-soft: rgba(212, 113, 106, 0.14);
+    --weg-track-off: #484a52;
+    --weg-track-on: #dcdcd8;
+    --weg-thumb: #18191c;
+    --weg-thumb-off: #e7e7e4;
+    box-sizing: border-box;
+    color: var(--weg-fg);
+    font-family: inherit;
+}
+
+.weg-modal.weg-theme-light,
+.weg-floating-menu.weg-theme-light {
+    --weg-bg: #f6f6f3;
+    --weg-bg-elevated: #eeeeea;
+    --weg-surface: #fcfcfb;
+    --weg-surface-hover: #f0f0ec;
+    --weg-surface-active: #e6e6e0;
+    --weg-fg: #222224;
+    --weg-fg-muted: #6c6c70;
+    --weg-border: #dfdfd9;
+    --weg-border-strong: #c6c6be;
+    --weg-accent: #2c2c2e;
+    --weg-accent-hover: #161618;
+    --weg-accent-fg: #fcfcfb;
+    --weg-accent-soft: rgba(44, 44, 46, 0.08);
+    --weg-if-accent: #366f65;
+    --weg-if-soft: rgba(54, 111, 101, 0.11);
+    --weg-danger: #b8443e;
+    --weg-danger-soft: rgba(184, 68, 62, 0.10);
+    --weg-track-off: #cbcbc3;
+    --weg-track-on: #2c2c2e;
+    --weg-thumb: #fcfcfb;
+    --weg-thumb-off: #ffffff;
+}
+
+/* Palette 2: 素纸青岚 */
+.weg-modal[data-weg-palette="ink"].weg-theme-light,
+.weg-floating-menu[data-weg-palette="ink"].weg-theme-light {
+    --weg-bg: #f1f4f6;
+    --weg-bg-elevated: #e7ecef;
+    --weg-surface: #fbfcfd;
+    --weg-surface-hover: #e6eef2;
+    --weg-surface-active: #dce6ec;
+    --weg-fg: #1f2d3a;
+    --weg-fg-muted: #5c6f82;
+    --weg-border: #d4dde3;
+    --weg-border-strong: #aebec9;
+    --weg-accent: #2c7a7b;
+    --weg-accent-hover: #236364;
+    --weg-accent-fg: #ffffff;
+    --weg-accent-soft: rgba(44, 122, 123, 0.11);
+    --weg-if-accent: #2c7a7b;
+    --weg-if-soft: rgba(44, 122, 123, 0.12);
+    --weg-track-off: #bdcad4;
+    --weg-track-on: #2c7a7b;
+    --weg-thumb: #ffffff;
+}
+
+.weg-modal[data-weg-palette="ink"].weg-theme-dark,
+.weg-floating-menu[data-weg-palette="ink"].weg-theme-dark {
+    --weg-bg: #20252d;
+    --weg-bg-elevated: #272d37;
+    --weg-surface: #2a313c;
+    --weg-surface-hover: #333c4a;
+    --weg-surface-active: #3d4758;
+    --weg-fg: #e2e8f0;
+    --weg-fg-muted: #94a3b8;
+    --weg-border: #384150;
+    --weg-border-strong: #515e73;
+    --weg-accent: #56b4b0;
+    --weg-accent-hover: #67c4c0;
+    --weg-accent-fg: #132226;
+    --weg-accent-soft: rgba(86, 180, 176, 0.16);
+    --weg-if-accent: #56b4b0;
+    --weg-if-soft: rgba(86, 180, 176, 0.16);
+    --weg-track-off: #4a5568;
+    --weg-track-on: #56b4b0;
+    --weg-thumb: #132226;
+}
+
+/* Palette 3: 暖笺琥珀 */
+.weg-modal[data-weg-palette="warm"].weg-theme-light,
+.weg-floating-menu[data-weg-palette="warm"].weg-theme-light {
+    --weg-bg: #f6f2ea;
+    --weg-bg-elevated: #ede7dc;
+    --weg-surface: #fdfbf7;
+    --weg-surface-hover: #f2ebe0;
+    --weg-surface-active: #e9dfd0;
+    --weg-fg: #2b241d;
+    --weg-fg-muted: #756759;
+    --weg-border: #dfd6c8;
+    --weg-border-strong: #c5b8a4;
+    --weg-accent: #b66634;
+    --weg-accent-hover: #9c5428;
+    --weg-accent-fg: #ffffff;
+    --weg-accent-soft: rgba(182, 102, 52, 0.11);
+    --weg-if-accent: #a65c2e;
+    --weg-if-soft: rgba(182, 102, 52, 0.12);
+    --weg-track-off: #cfc4b4;
+    --weg-track-on: #b66634;
+    --weg-thumb: #ffffff;
+}
+
+.weg-modal[data-weg-palette="warm"].weg-theme-dark,
+.weg-floating-menu[data-weg-palette="warm"].weg-theme-dark {
+    --weg-bg: #221e1b;
+    --weg-bg-elevated: #2a2521;
+    --weg-surface: #2d2823;
+    --weg-surface-hover: #37312b;
+    --weg-surface-active: #423b34;
+    --weg-fg: #efe8df;
+    --weg-fg-muted: #a6998c;
+    --weg-border: #3d352e;
+    --weg-border-strong: #574c42;
+    --weg-accent: #de935f;
+    --weg-accent-hover: #eaa372;
+    --weg-accent-fg: #231810;
+    --weg-accent-soft: rgba(222, 147, 95, 0.16);
+    --weg-if-accent: #de935f;
+    --weg-if-soft: rgba(222, 147, 95, 0.16);
+    --weg-track-off: #544940;
+    --weg-track-on: #de935f;
+    --weg-thumb: #231810;
+}
+
+/* Palette 4: 雾粉紫烟 */
+.weg-modal[data-weg-palette="sakura"].weg-theme-light,
+.weg-floating-menu[data-weg-palette="sakura"].weg-theme-light {
+    --weg-bg: #f8f4f7;
+    --weg-bg-elevated: #f0e8ee;
+    --weg-surface: #fefcfd;
+    --weg-surface-hover: #f4eaf0;
+    --weg-surface-active: #ecdde6;
+    --weg-fg: #2c2129;
+    --weg-fg-muted: #766270;
+    --weg-border: #e5d7e0;
+    --weg-border-strong: #ccb7c5;
+    --weg-accent: #b85c88;
+    --weg-accent-hover: #9e4b73;
+    --weg-accent-fg: #ffffff;
+    --weg-accent-soft: rgba(184, 92, 136, 0.11);
+    --weg-if-accent: #a64f79;
+    --weg-if-soft: rgba(184, 92, 136, 0.12);
+    --weg-track-off: #d4c3ce;
+    --weg-track-on: #b85c88;
+    --weg-thumb: #ffffff;
+}
+
+.weg-modal[data-weg-palette="sakura"].weg-theme-dark,
+.weg-floating-menu[data-weg-palette="sakura"].weg-theme-dark {
+    --weg-bg: #211d24;
+    --weg-bg-elevated: #29242d;
+    --weg-surface: #2c2732;
+    --weg-surface-hover: #362f3e;
+    --weg-surface-active: #41394a;
+    --weg-fg: #efe8f0;
+    --weg-fg-muted: #a696aa;
+    --weg-border: #3d3544;
+    --weg-border-strong: #564a60;
+    --weg-accent: #dc88b0;
+    --weg-accent-hover: #e79bc0;
+    --weg-accent-fg: #24131c;
+    --weg-accent-soft: rgba(220, 136, 176, 0.16);
+    --weg-if-accent: #dc88b0;
+    --weg-if-soft: rgba(220, 136, 176, 0.16);
+    --weg-track-off: #53485c;
+    --weg-track-on: #dc88b0;
+    --weg-thumb: #24131c;
+}
+
+/* Palette 5: 跟随酒馆 (Opaque solid fallback mixed from SmartTheme tokens so glass themes never bleed text) */
+.weg-modal[data-weg-palette="host"].weg-theme-light,
+.weg-floating-menu[data-weg-palette="host"].weg-theme-light {
+    --weg-bg: color-mix(in srgb, var(--SmartThemeBlurTintColor, #f5f5f5) 88%, #ffffff);
+    --weg-bg-elevated: color-mix(in srgb, var(--SmartThemeBodyColor, #222222) 6%, #f4f4f4);
+    --weg-surface: color-mix(in srgb, var(--SmartThemeBlurTintColor, #ffffff) 94%, #ffffff);
+    --weg-surface-hover: color-mix(in srgb, var(--SmartThemeBodyColor, #222222) 8%, #ffffff);
+    --weg-surface-active: color-mix(in srgb, var(--SmartThemeBodyColor, #222222) 13%, #ffffff);
+    --weg-fg: var(--SmartThemeBodyColor, #1f2329);
+    --weg-fg-muted: color-mix(in srgb, var(--weg-fg) 64%, #888888);
+    --weg-border: color-mix(in srgb, var(--weg-fg) 16%, #dddddd);
+    --weg-border-strong: color-mix(in srgb, var(--weg-fg) 30%, #cccccc);
+    --weg-accent: var(--SmartThemeQuoteColor, #2f5e58);
+    --weg-accent-hover: color-mix(in srgb, var(--weg-accent) 85%, #000000);
+    --weg-accent-fg: #ffffff;
+    --weg-track-off: color-mix(in srgb, var(--weg-fg) 24%, #d0d0d0);
+    --weg-track-on: var(--weg-accent);
+    --weg-thumb: #ffffff;
+}
+
+.weg-modal[data-weg-palette="host"].weg-theme-dark,
+.weg-floating-menu[data-weg-palette="host"].weg-theme-dark {
+    --weg-bg: color-mix(in srgb, var(--SmartThemeBlurTintColor, #1e2128) 88%, #181a20);
+    --weg-bg-elevated: color-mix(in srgb, var(--SmartThemeBodyColor, #e2e8f0) 6%, #1f222a);
+    --weg-surface: color-mix(in srgb, var(--SmartThemeBlurTintColor, #252830) 90%, #20232b);
+    --weg-surface-hover: color-mix(in srgb, var(--SmartThemeBodyColor, #e2e8f0) 9%, #23262f);
+    --weg-surface-active: color-mix(in srgb, var(--SmartThemeBodyColor, #e2e8f0) 14%, #262a34);
+    --weg-fg: var(--SmartThemeBodyColor, #e2e8f0);
+    --weg-fg-muted: color-mix(in srgb, var(--weg-fg) 66%, #888888);
+    --weg-border: color-mix(in srgb, var(--weg-fg) 16%, #2c303a);
+    --weg-border-strong: color-mix(in srgb, var(--weg-fg) 28%, #3a3f4c);
+    --weg-accent: var(--SmartThemeQuoteColor, #6ab0a6);
+    --weg-accent-hover: color-mix(in srgb, var(--weg-accent) 85%, #ffffff);
+    --weg-accent-fg: #14181d;
+    --weg-track-off: color-mix(in srgb, var(--weg-fg) 24%, #3c404d);
+    --weg-track-on: var(--weg-accent);
+    --weg-thumb: #14181d;
+}
+
+/* ==========================================================================
+   Modal Shell — Transparent Backdrop & Strictly Fixed Window Size
+   ========================================================================== */
+.weg-modal-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 31000;
+    background: transparent;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    pointer-events: auto;
+}
+
+.weg-modal {
+    position: relative;
+    width: 760px;
+    max-width: calc(100vw - 28px);
+    height: 620px;
+    max-height: calc(100vh - 32px);
+    background: var(--weg-bg);
+    border: 1px solid var(--weg-border-strong);
+    border-radius: 10px;
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.26);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    box-sizing: border-box;
+    line-height: 1.4;
+}
+
+.weg-modal *,
+.weg-floating-menu * {
+    box-sizing: border-box;
+}
+
+/* Constant Top Header */
+.weg-header {
+    flex-shrink: 0;
+    height: 48px;
+    padding: 0 14px;
+    background: var(--weg-bg-elevated);
+    border-bottom: 1px solid var(--weg-border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    cursor: grab;
+    user-select: none;
+}
+
+.weg-header:active {
+    cursor: grabbing;
+}
+
+.weg-header-title-wrap {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+    overflow: hidden;
+}
+
+.weg-header-title {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--weg-fg);
+    white-space: nowrap;
+}
+
+.weg-header-stats {
+    font-size: 12px;
+    color: var(--weg-fg-muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.weg-header-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+}
+
+/* Constant Second-Row Toolbar (Uniform height = 34px, radius = 6px) */
+.weg-toolbar {
+    flex-shrink: 0;
+    padding: 8px 14px;
+    background: var(--weg-bg);
+    border-bottom: 1px solid var(--weg-border);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.weg-book-bar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    width: 42%;
+    min-width: 180px;
+    flex-shrink: 0;
+}
+
+.weg-filter-bar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex: 1;
+    min-width: 0;
+}
+
+.weg-search-wrap {
+    position: relative;
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+}
+
+.weg-search-icon {
+    position: absolute;
+    left: 10px;
+    font-size: 12px;
+    color: var(--weg-fg-muted);
+    pointer-events: none;
+}
+
+.weg-input,
+.weg-select {
+    height: 34px;
+    border-radius: 6px;
+    border: 1px solid var(--weg-border);
+    background: var(--weg-surface);
+    color: var(--weg-fg);
+    font-size: 13px;
+    padding: 0 10px;
+    margin: 0;
+    outline: none;
+    line-height: 32px;
+}
+
+.weg-input:focus,
+.weg-select:focus {
+    border-color: var(--weg-border-strong);
+}
+
+.weg-book-select {
+    flex: 1;
+    min-width: 0;
+}
+
+.weg-search-input {
+    width: 100%;
+    padding-left: 30px;
+    padding-right: 46px;
+}
+
+.weg-status-select {
+    width: 104px;
+    flex-shrink: 0;
+}
+
+.weg-clear-input-btn {
+    position: absolute;
+    right: 6px;
+    height: 22px;
+    padding: 0 7px;
+    border-radius: 4px;
+    border: 1px solid var(--weg-border);
+    background: var(--weg-bg-elevated);
+    color: var(--weg-fg-muted);
+    font-size: 11px;
+    cursor: pointer;
+    line-height: 20px;
+}
+
+.weg-clear-input-btn:hover {
+    color: var(--weg-fg);
+    background: var(--weg-surface-hover);
+}
+
+.weg-input-with-clear {
+    position: relative;
+    display: flex;
+    align-items: center;
+    width: 100%;
+}
+
+.weg-input-with-clear .weg-input {
+    width: 100%;
+    padding-right: 52px;
+}
+
+/* Uniform Buttons */
+.weg-btn,
+.weg-icon-btn {
+    height: 32px;
+    border-radius: 6px;
+    border: 1px solid var(--weg-border);
+    background: var(--weg-surface);
+    color: var(--weg-fg);
+    font-size: 13px;
+    padding: 0 12px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    cursor: pointer;
+    white-space: nowrap;
+    margin: 0;
+    transition: background-color 0.12s ease, border-color 0.12s ease;
+}
+
+.weg-toolbar .weg-icon-btn {
+    height: 34px;
+    width: 34px;
+    padding: 0;
+}
+
+.weg-icon-btn {
+    width: 32px;
+    padding: 0;
+}
+
+.weg-btn:hover:not(:disabled),
+.weg-icon-btn:hover:not(:disabled) {
+    background: var(--weg-surface-hover);
+    border-color: var(--weg-border-strong);
+}
+
+.weg-btn:disabled,
+.weg-icon-btn:disabled {
+    opacity: 0.42;
+    cursor: not-allowed;
+}
+
+.weg-btn-primary {
+    background: var(--weg-accent);
+    border-color: var(--weg-accent);
+    color: var(--weg-accent-fg);
+    font-weight: 500;
+}
+
+.weg-btn-primary:hover:not(:disabled) {
+    background: var(--weg-accent-hover);
+    border-color: var(--weg-accent-hover);
+}
+
+.weg-btn-danger {
+    color: var(--weg-danger);
+    border-color: color-mix(in srgb, var(--weg-danger) 45%, var(--weg-border));
+    background: var(--weg-danger-soft);
+}
+
+.weg-btn-danger:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--weg-danger) 22%, transparent);
+}
+
+/* ==========================================================================
+   Scrollable Middle Body — Group Cards & Single-Line Entry Rows
+   ========================================================================== */
+.weg-body {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 10px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.weg-inline-notice {
+    padding: 8px 12px;
+    border-radius: 6px;
+    border: 1px solid color-mix(in srgb, var(--weg-if-accent) 42%, var(--weg-border));
+    background: var(--weg-if-soft);
+    color: var(--weg-fg);
+    font-size: 12px;
+    flex-shrink: 0;
+}
+
+.weg-group-card {
+    border: 1px solid var(--weg-border);
+    border-radius: 8px;
+    background: var(--weg-surface);
+    overflow: hidden;
+    flex-shrink: 0;
+}
+
+.weg-group-card.is-active-if {
+    border-color: color-mix(in srgb, var(--weg-if-accent) 55%, var(--weg-border));
+}
+
+.weg-group-header {
+    height: 40px;
+    padding: 0 10px 0 12px;
+    background: var(--weg-bg-elevated);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    cursor: pointer;
+    user-select: none;
+}
+
+.weg-group-header:hover {
+    background: var(--weg-surface-hover);
+}
+
+.weg-group-header-main {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    flex: 1;
+}
+
+.weg-chevron {
+    width: 12px;
+    font-size: 11px;
+    color: var(--weg-fg-muted);
+    text-align: center;
+    flex-shrink: 0;
+}
+
+.weg-group-name {
+    font-size: 13.5px;
+    font-weight: 600;
+    color: var(--weg-fg);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.weg-badge {
+    font-size: 11px;
+    padding: 1px 6px;
+    border-radius: 4px;
+    border: 1px solid var(--weg-border);
+    background: var(--weg-surface);
+    color: var(--weg-fg-muted);
+    white-space: nowrap;
+    flex-shrink: 0;
+}
+
+.weg-badge-if {
+    color: var(--weg-if-accent);
+    background: var(--weg-if-soft);
+    border-color: color-mix(in srgb, var(--weg-if-accent) 40%, transparent);
+}
+
+.weg-badge-radio {
+    color: var(--weg-fg);
+    background: var(--weg-accent-soft);
+}
+
+.weg-group-count {
+    font-size: 12px;
+    color: var(--weg-fg-muted);
+    white-space: nowrap;
+    flex-shrink: 0;
+}
+
+.weg-group-empty {
+    padding: 12px;
+    font-size: 12px;
+    color: var(--weg-fg-muted);
+    text-align: center;
+    border-top: 1px solid var(--weg-border);
+}
+
+.weg-entry-list {
+    border-top: 1px solid var(--weg-border);
+    display: flex;
+    flex-direction: column;
+}
+
+/* Strictly single-line entry row: zero two-line wrapping, zero diagonal whitespace */
+.weg-entry-row {
+    height: 38px;
+    padding: 0 10px 0 14px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    border-bottom: 1px solid var(--weg-border);
+    background: var(--weg-surface);
+}
+
+.weg-entry-row:last-child {
+    border-bottom: none;
+}
+
+.weg-entry-row:hover {
+    background: var(--weg-surface-hover);
+}
+
+.weg-entry-row.is-batch {
+    cursor: pointer;
+}
+
+.weg-entry-row.is-selected {
+    background: var(--weg-accent-soft);
+}
+
+.weg-entry-row.is-disabled .weg-entry-title {
+    color: var(--weg-fg-muted);
+}
+
+.weg-entry-main {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    min-width: 0;
+    flex: 1;
+    overflow: hidden;
+}
+
+.weg-checkbox {
+    width: 16px;
+    height: 16px;
+    border-radius: 4px;
+    border: 1px solid var(--weg-border-strong);
+    background: var(--weg-bg);
+    color: var(--weg-accent-fg);
+    font-size: 11px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+}
+
+.weg-checkbox.is-checked {
+    background: var(--weg-accent);
+    border-color: var(--weg-accent);
+}
+
+.weg-strategy-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    background: #6ea87f;
+}
+
+.weg-strategy-dot.is-constant {
+    background: #6798c0;
+}
+
+.weg-strategy-dot.is-vector {
+    background: #a486c2;
+}
+
+.weg-entry-row.is-disabled .weg-strategy-dot {
+    opacity: 0.35;
+}
+
+.weg-entry-uid {
+    font-size: 11.5px;
+    color: var(--weg-fg-muted);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    flex-shrink: 0;
+}
+
+.weg-entry-title {
+    font-size: 13px;
+    color: var(--weg-fg);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.weg-greet-tag {
+    font-size: 11px;
+    padding: 1px 6px;
+    border-radius: 4px;
+    background: var(--weg-accent-soft);
+    color: var(--weg-fg-muted);
+    border: 1px solid var(--weg-border);
+    white-space: nowrap;
+    flex-shrink: 0;
+}
+
+.weg-greet-tag.is-current {
+    color: var(--weg-if-accent);
+    background: var(--weg-if-soft);
+    border-color: color-mix(in srgb, var(--weg-if-accent) 42%, transparent);
+}
+
+.weg-greet-tag.is-exclude {
+    color: var(--weg-danger);
+    background: var(--weg-danger-soft);
+}
+
+/* Right-side compact control pair: 1 toggle switch + 1 `···` button */
+.weg-row-controls {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+}
+
+.weg-switch {
+    position: relative;
+    width: 36px;
+    height: 20px;
+    border-radius: 999px;
+    border: none;
+    padding: 0;
+    margin: 0;
+    background: var(--weg-track-off);
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: background-color 0.14s ease;
+}
+
+.weg-switch.weg-switch-sm {
+    width: 32px;
+    height: 18px;
+}
+
+.weg-switch.is-partial {
+    background: color-mix(in srgb, var(--weg-track-on) 48%, var(--weg-track-off));
+}
+
+.weg-switch.is-on {
+    background: var(--weg-track-on);
+}
+
+.weg-switch:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+
+.weg-switch-thumb {
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: var(--weg-thumb-off);
+    transition: transform 0.14s ease, background-color 0.14s ease;
+}
+
+.weg-switch.weg-switch-sm .weg-switch-thumb {
+    width: 14px;
+    height: 14px;
+}
+
+.weg-switch.is-on .weg-switch-thumb {
+    transform: translateX(16px);
+    background: var(--weg-thumb);
+}
+
+.weg-switch.weg-switch-sm.is-on .weg-switch-thumb {
+    transform: translateX(14px);
+}
+
+.weg-more-btn {
+    width: 28px;
+    height: 26px;
+    border-radius: 5px;
+    border: 1px solid transparent;
+    background: transparent;
+    color: var(--weg-fg-muted);
+    font-size: 14px;
+    font-weight: 700;
+    line-height: 1;
+    padding: 0;
+    margin: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+}
+
+.weg-more-btn:hover {
+    background: var(--weg-surface-active);
+    border-color: var(--weg-border);
+    color: var(--weg-fg);
+}
+
+/* Empty State */
+.weg-empty-state {
+    margin: auto;
+    padding: 28px 20px;
+    text-align: center;
+    max-width: 420px;
+}
+
+.weg-empty-state.weg-empty-compact {
+    padding: 18px 12px;
+}
+
+.weg-empty-title {
+    margin: 0 0 6px;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--weg-fg);
+}
+
+.weg-empty-desc {
+    margin: 0;
+    font-size: 12.5px;
+    color: var(--weg-fg-muted);
+    line-height: 1.5;
+}
+
+/* ==========================================================================
+   Constant Bottom Footer Bar
+   ========================================================================== */
+.weg-footer {
+    flex-shrink: 0;
+    min-height: 48px;
+    padding: 8px 14px;
+    background: var(--weg-bg-elevated);
+    border-top: 1px solid var(--weg-border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+}
+
+.weg-footer-status {
+    font-size: 12.5px;
+    color: var(--weg-fg-muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.weg-footer-buttons {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+}
+
+/* ==========================================================================
+   Stacked Submodal Host (Inside `.weg-modal` — zero outer window resize!)
+   ========================================================================== */
+.weg-submodal-host {
+    position: absolute;
+    inset: 0;
+    z-index: 20;
+    background: rgba(0, 0, 0, 0.28);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+}
+
+.weg-submodal-card {
+    width: 460px;
+    max-width: 100%;
+    max-height: 100%;
+    background: var(--weg-bg);
+    border: 1px solid var(--weg-border-strong);
+    border-radius: 8px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.24);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+.weg-submodal-card.weg-submodal-wide {
+    width: 560px;
+}
+
+.weg-submodal-header {
+    height: 44px;
+    padding: 0 12px 0 14px;
+    background: var(--weg-bg-elevated);
+    border-bottom: 1px solid var(--weg-border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-shrink: 0;
+}
+
+.weg-submodal-title {
+    font-size: 14px;
+    font-weight: 600;
+}
+
+.weg-submodal-body {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 14px;
+}
+
+.weg-submodal-footer {
+    padding: 8px 14px;
+    background: var(--weg-bg-elevated);
+    border-top: 1px solid var(--weg-border);
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 8px;
+    flex-shrink: 0;
+}
+
+.weg-field-label {
+    display: block;
+    font-size: 12.5px;
+    font-weight: 500;
+    color: var(--weg-fg-muted);
+    margin-bottom: 6px;
+}
+
+.weg-mode-options {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.weg-mode-card {
+    display: flex;
+    align-items: flex-start;
+    gap: 9px;
+    padding: 9px 11px;
+    border-radius: 6px;
+    border: 1px solid var(--weg-border);
+    background: var(--weg-surface);
+    cursor: pointer;
+}
+
+.weg-mode-card.is-active {
+    border-color: var(--weg-border-strong);
+    background: var(--weg-accent-soft);
+}
+
+.weg-mode-card input[type="radio"] {
+    margin-top: 3px;
+}
+
+.weg-mode-card-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--weg-fg);
+}
+
+.weg-mode-card-desc {
+    font-size: 12px;
+    color: var(--weg-fg-muted);
+    margin-top: 2px;
+}
+
+/* Batch Move Target List */
+.weg-move-target-list {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    max-height: 220px;
+    overflow-y: auto;
+}
+
+.weg-move-target-btn {
+    height: 36px;
+    padding: 0 12px;
+    border-radius: 6px;
+    border: 1px solid var(--weg-border);
+    background: var(--weg-surface);
+    color: var(--weg-fg);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    cursor: pointer;
+    font-size: 13px;
+}
+
+.weg-move-target-btn:hover {
+    background: var(--weg-surface-hover);
+    border-color: var(--weg-border-strong);
+}
+
+.weg-move-target-meta {
+    font-size: 11.5px;
+    color: var(--weg-fg-muted);
+}
+
+.weg-inline-new-group {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.weg-inline-new-group .weg-btn {
+    height: 34px;
+}
+
+/* Auto-Detect Preview */
+.weg-detect-controls {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 10px;
+    flex-wrap: wrap;
+}
+
+.weg-detect-controls .weg-select {
+    flex: 1;
+    min-width: 210px;
+}
+
+.weg-inline-check {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12.5px;
+    color: var(--weg-fg);
+    cursor: pointer;
+}
+
+.weg-detect-list {
+    border: 1px solid var(--weg-border);
+    border-radius: 6px;
+    background: var(--weg-surface);
+    max-height: 280px;
+    overflow-y: auto;
+}
+
+.weg-detect-row {
+    min-height: 38px;
+    padding: 4px 10px;
+    border-bottom: 1px solid var(--weg-border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+.weg-detect-row:last-child {
+    border-bottom: none;
+}
+
+.weg-detect-check-label {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    min-width: 0;
+    flex: 1;
+    cursor: pointer;
+}
+
+.weg-detect-name {
+    font-size: 13px;
+    font-weight: 500;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.weg-detect-mode-select {
+    height: 28px;
+    line-height: 26px;
+    font-size: 12px;
+    padding: 0 6px;
+    width: 94px;
+    flex-shrink: 0;
+}
+
+/* Settings Rows (Right-aligned uniform control widths per `AGENTS.md`) */
+.weg-settings-list {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.weg-setting-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 8px 10px;
+    border-radius: 6px;
+    border: 1px solid var(--weg-border);
+    background: var(--weg-surface);
+}
+
+.weg-setting-text {
+    min-width: 0;
+    flex: 1;
+}
+
+.weg-setting-name {
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--weg-fg);
+}
+
+.weg-setting-desc {
+    font-size: 11.5px;
+    color: var(--weg-fg-muted);
+    margin-top: 2px;
+}
+
+.weg-setting-control {
+    width: 126px;
+    flex-shrink: 0;
+}
+
+/* ==========================================================================
+   Anchored Floating `···` Menu (Explicitly excluded from mobile fullscreen!)
+   ========================================================================== */
+.weg-floating-menu {
+    position: fixed;
+    z-index: 32000;
+    min-width: 176px;
+    max-width: min(260px, calc(100vw - 16px));
+    padding: 4px;
+    border-radius: 8px;
+    border: 1px solid var(--weg-border-strong);
+    background: var(--weg-bg);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.weg-floating-menu-item {
+    height: 34px;
+    padding: 0 10px;
+    border-radius: 5px;
+    border: none;
+    background: transparent;
+    color: var(--weg-fg);
+    font-size: 13px;
+    text-align: left;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.weg-floating-menu-item:hover:not(:disabled) {
+    background: var(--weg-surface-hover);
+}
+
+.weg-floating-menu-item:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+.weg-floating-menu-item.is-danger {
+    color: var(--weg-danger);
+}
+
+.weg-menu-icon {
+    width: 15px;
+    text-align: center;
+    font-size: 12px;
+    opacity: 0.85;
+    flex-shrink: 0;
+}
+
+/* ==========================================================================
+   Mobile & Narrow Screen Adaptation (Safe Areas, Balanced Full-Width Footer)
+   Explicitly targets `.weg-modal:not(.weg-floating-menu)` per `AGENTS.md`!
+   ========================================================================== */
+@media (max-width: 768px) {
+    .weg-modal:not(.weg-floating-menu) {
+        width: 100vw;
+        max-width: 100vw;
+        height: 100dvh;
+        max-height: 100dvh;
+        border-radius: 0;
+        border: none;
+        padding-top: env(safe-area-inset-top, 0px);
+    }
+
+    .weg-header {
+        cursor: default;
+        padding: 0 10px;
+    }
+
+    .weg-header-stats {
+        display: none;
+    }
+
+    .weg-toolbar {
+        flex-direction: column;
+        align-items: stretch;
+        padding: 8px 10px;
+        gap: 6px;
+    }
+
+    .weg-book-bar {
+        width: 100%;
+    }
+
+    .weg-body {
+        padding: 8px 10px;
+    }
+
+    .weg-footer {
+        flex-direction: column;
+        align-items: stretch;
+        gap: 6px;
+        padding: 8px 10px calc(8px + env(safe-area-inset-bottom, 0px));
+    }
+
+    .weg-footer-status {
+        display: flex;
+        justify-content: space-between;
+        font-size: 12px;
+    }
+
+    .weg-footer-buttons {
+        width: 100%;
+        display: flex;
+        gap: 6px;
+    }
+
+    .weg-footer-buttons .weg-btn {
+        flex: 1;
+        min-width: 0;
+    }
+
+    .weg-submodal-host {
+        padding: 10px;
+    }
+
+    .weg-submodal-footer {
+        display: flex;
+        gap: 8px;
+    }
+
+    .weg-submodal-footer .weg-btn {
+        flex: 1;
+    }
+
+    .weg-inline-new-group {
+        flex-direction: column;
+        align-items: stretch;
+    }
+}

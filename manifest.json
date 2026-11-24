@@ -1,0 +1,10 @@
+{
+  "display_name": "世界书条目分组 (Worldbook Entry Groups)",
+  "loading_order": 510,
+  "js": "index.js",
+  "css": "style.css",
+  "author": "Mio-Ame",
+  "version": "0.1.0",
+  "homePage": "https://github.com/Mio-Ame/worldbook-entry-groups",
+  "auto_update": true
+}
