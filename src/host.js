@@ -7,16 +7,23 @@
  * 2. Batch group / IF-line switches perform a single `/api/worldinfo/edit` write,
  *    preserving 100% of original entry fields while keeping any already-cached active
  *    worldbook and open native editor synchronized.
- * 3. Coordinates cleanly with greeting-based lore automation (`<!-- lore / exclude -->`)
- *    without modifying host files or coupling to external scripts.
+ * 3. Per-chat save route binding (`chatMetadata` + fallback `chatProfiles`): remembers
+ *    which IF line / entry state each chat save uses (even 100+ floors deep or in branched saves)
+ *    and restores it automatically on `CHAT_CHANGED`.
  */
 
 import {
     MODULE_NAME,
     applyTogglePlanToPayload,
+    buildChatProfileFromCurrentState,
     buildGreetingCoordinationIndex,
+    computeChatProfileRestorePlan,
     extractWorldbookEntrySummaries,
+    inferChatRouteFromMessages,
+    normalizeBookConfig,
+    normalizeChatProfile,
     normalizeSettings,
+    upsertStoredChatProfile,
 } from './core.js';
 
 let _worldInfoModule = null;
@@ -179,7 +186,6 @@ export function getWorldNames() {
         }
     }
 
-    // Last-resort DOM fallback ONLY if host memory modules have not populated yet
     if (cleanList.length === 0 && typeof document !== 'undefined') {
         const sel = document.getElementById('world_editor_select') || document.getElementById('world_info');
         if (sel) {
@@ -232,7 +238,6 @@ export function getCurrentCharacterPrimaryWorldName() {
         if (typeof charWorld === 'string' && charWorld.trim()) {
             return charWorld.trim();
         }
-        // Optional read-only fallback to companion `worldbook_organizer` cached binding for shallow cards
         const wboCached = ctx?.extensionSettings?.worldbook_organizer?.cachedCharBindings?.[ch?.avatar];
         if (typeof wboCached?.primary === 'string' && wboCached.primary.trim()) {
             return wboCached.primary.trim();
@@ -248,11 +253,113 @@ export function getCurrentCharacterPrimaryWorldName() {
 }
 
 /**
- * Pick the most helpful initial worldbook when opening the panel:
- * 1. Currently open worldbook in `#world_editor_select`
- * 2. Active character's primary worldbook / chat worldbook
- * 3. Previously opened worldbook in settings
- * 4. First available worldbook
+ * Return identity & primary worldbook metadata for the currently open chat save, if any.
+ * @returns {{ chatId: string, chatKey: string, characterName: string, primaryWorldName: string, floorCount: number } | null}
+ */
+export function getCurrentChatSaveContext() {
+    const ctx = getHostContext();
+    if (!ctx) return null;
+
+    let rawChatId = '';
+    if (typeof ctx.getCurrentChatId === 'function') {
+        try {
+            rawChatId = String(ctx.getCurrentChatId() ?? '').trim();
+        } catch {
+            rawChatId = '';
+        }
+    }
+    if (!rawChatId) {
+        rawChatId = String(ctx.chatId ?? '').trim();
+    }
+
+    let avatarKey = '';
+    let characterName = '';
+    if (ctx.groupId) {
+        avatarKey = `group_${ctx.groupId}`;
+        characterName = '群聊';
+    } else if (ctx.characterId !== undefined && ctx.characterId !== null && ctx.characterId !== '') {
+        const ch = ctx.characters?.[Number(ctx.characterId)];
+        avatarKey = String(ch?.avatar ?? '').trim();
+        characterName = String(ch?.name || ch?.data?.name || '').trim();
+        if (!rawChatId && ch?.chat) {
+            rawChatId = String(ch.chat).trim();
+        }
+    }
+
+    if (!rawChatId) return null;
+
+    const primaryWorldName = getCurrentCharacterPrimaryWorldName() || '';
+    const floorCount = Array.isArray(ctx.chat) ? ctx.chat.length : 0;
+
+    return {
+        chatId: rawChatId,
+        chatKey: `${avatarKey || 'chat'}::${rawChatId}`,
+        characterName,
+        primaryWorldName,
+        floorCount,
+    };
+}
+
+/**
+ * Read the bound route profile for the currently active chat save (if any).
+ * Checks per-chat `chatMetadata.worldbook_entry_groups` first, falling back to `settings.chatProfiles[chatKey]`.
+ *
+ * @param {string} [expectedWorldName]
+ */
+export function getActiveChatBoundProfile(expectedWorldName = '') {
+    const saveCtx = getCurrentChatSaveContext();
+    if (!saveCtx) return { saveCtx: null, profile: null };
+
+    const ctx = getHostContext();
+    const settings = getSettings();
+
+    const metaProfile = normalizeChatProfile(ctx?.chatMetadata?.[MODULE_NAME]);
+    const storedProfile = normalizeChatProfile(settings.chatProfiles?.[saveCtx.chatKey]);
+    const candidate = metaProfile || storedProfile || null;
+
+    const cleanExpected = String(expectedWorldName ?? '').trim();
+    if (candidate && cleanExpected && candidate.worldName !== cleanExpected) {
+        return { saveCtx, profile: null };
+    }
+
+    return { saveCtx, profile: candidate };
+}
+
+/**
+ * Persist a route profile into BOTH the active chat's `.jsonl` `chatMetadata` AND `settings.chatProfiles`.
+ * Pass `null` to unbind the active chat save.
+ *
+ * @param {any | null} rawProfile
+ * @returns {boolean}
+ */
+export function saveActiveChatBoundProfile(rawProfile) {
+    const saveCtx = getCurrentChatSaveContext();
+    if (!saveCtx) return false;
+
+    const ctx = getHostContext();
+    const settings = getSettings();
+    const norm = rawProfile ? normalizeChatProfile(rawProfile) : null;
+
+    if (ctx?.chatMetadata && typeof ctx.chatMetadata === 'object') {
+        if (norm) {
+            ctx.chatMetadata[MODULE_NAME] = norm;
+        } else {
+            delete ctx.chatMetadata[MODULE_NAME];
+        }
+        if (typeof ctx.saveMetadataDebounced === 'function') {
+            try { ctx.saveMetadataDebounced(); } catch { /* ignore */ }
+        } else if (typeof ctx.saveMetadata === 'function') {
+            try { void ctx.saveMetadata(); } catch { /* ignore */ }
+        }
+    }
+
+    upsertStoredChatProfile(settings, saveCtx.chatKey, norm);
+    saveSettings();
+    return true;
+}
+
+/**
+ * Pick the most helpful initial worldbook when opening the panel.
  *
  * @param {Record<string, any>} settings
  * @returns {string}
@@ -327,7 +434,6 @@ export async function loadWorldbookSummariesUncached(worldName) {
     }
 
     const summaries = extractWorldbookEntrySummaries(payload);
-    // Drop multi-hundred-KB entry content immediately so mobile GC reclaims RAM
     payload = null;
 
     return { ok: true, summaries };
@@ -345,7 +451,6 @@ async function syncHostCacheAndOpenEditorIfPresent(worldName, updatedPayload, ap
     await ensureWorldInfoModule();
     const cache = _worldInfoModule?.worldInfoCache;
 
-    // Update existing cache entry in place without adding uncached books into memory
     let wasInCache = false;
     if (cache instanceof Map && cache.has(worldName)) {
         wasInCache = true;
@@ -367,7 +472,6 @@ async function syncHostCacheAndOpenEditorIfPresent(worldName, updatedPayload, ap
         cache[worldName] = updatedPayload;
     }
 
-    // If native `#world_editor_select` currently has this exact book open, keep its DOM synchronized
     if (getCurrentEditorWorldName() === worldName && typeof document !== 'undefined') {
         if (typeof _worldInfoModule?.reloadEditor === 'function' && wasInCache) {
             try {
@@ -463,7 +567,8 @@ export async function applyWorldbookTogglePlan(worldName, togglePlan) {
 
 /**
  * Resolve greeting comment coordination (`<!-- lore / exclude / title -->`) for the character
- * bound to `worldName`, preferring live floor-0 swipes when inspecting the active chat's book.
+ * bound to `worldName`, ALWAYS combining full character-card greetings with live floor-0 swipes
+ * so multi-floor or branched chats never lose sibling IF-line UID sets!
  *
  * @param {string} worldName
  * @param {{ allowFetchShallow?: boolean }} [opts]
@@ -476,14 +581,13 @@ export async function resolveGreetingCoordinationForBook(worldName, { allowFetch
     const ctx = getHostContext();
     const characters = Array.isArray(ctx?.characters) ? ctx.characters : [];
 
-    // 1. Check active chat character first (gives live `currentSwipeId` & edited floor-0 swipes!)
     if (ctx && !ctx.groupId && ctx.characterId !== undefined && ctx.characterId !== null && ctx.characterId !== '') {
         const activeChar = characters[Number(ctx.characterId)];
         const activeBook = getCurrentCharacterPrimaryWorldName();
         if (activeChar && activeBook === clean) {
             const msg0 = ctx.chat?.[0];
             const swipes = Array.isArray(msg0?.swipes) && msg0.swipes.length > 0 ? msg0.swipes : null;
-            const currentSwipeId = Number.isInteger(msg0?.swipe_id) ? msg0.swipe_id : 0;
+            const currentSwipeId = Number.isInteger(msg0?.swipe_id) ? msg0.swipe_id : null;
             const idx = buildGreetingCoordinationIndex({
                 swipes,
                 firstMes: activeChar.first_mes || activeChar.data?.first_mes || '',
@@ -497,7 +601,6 @@ export async function resolveGreetingCoordinationForBook(worldName, { allowFetch
         }
     }
 
-    // 2. Check already-loaded in-memory characters bound to `worldName` (zero disk I/O)
     const matchedLoaded = characters.find(
         (ch) => ch && !ch.shallow && String(ch?.data?.extensions?.world ?? '').trim() === clean,
     );
@@ -513,7 +616,6 @@ export async function resolveGreetingCoordinationForBook(worldName, { allowFetch
         };
     }
 
-    // 3. On-demand single-card fetch ONLY when user explicitly triggers greeting auto-detect on a shallow card
     if (allowFetchShallow) {
         const wboBindings = ctx?.extensionSettings?.worldbook_organizer?.cachedCharBindings;
         let targetAvatar = null;
@@ -553,8 +655,105 @@ export async function resolveGreetingCoordinationForBook(worldName, { allowFetch
 }
 
 /**
+ * Automatically recognize & restore the active chat save's IF-line / entry state!
+ * - On `floor0-swipe` (when `chat.length === 1`): updates this save's bound route to match the newly chosen greeting.
+ * - On `chat-changed` (even 100+ floors deep or in `/branch` saves): uses the save's bound `chatMetadata` profile,
+ *   or infers the route from `ctx.chat` messages + character card greetings, binds it, and restores the worldbook
+ *   in a single write if any entry differs!
+ *
+ * @param {{ reason?: 'chat-changed' | 'floor0-swipe' | 'manual', silentToast?: boolean }} [opts]
+ * @returns {Promise<{ synced: boolean, changedCount: number, routeLabel: string, worldName: string }>}
+ */
+export async function syncWorldbookForActiveChat({ reason = 'chat-changed', silentToast = false } = {}) {
+    const settings = getSettings();
+    if (reason !== 'manual' && settings.autoSwitchOnChatChange === false) {
+        return { synced: false, changedCount: 0, routeLabel: '', worldName: '' };
+    }
+
+    const ctx = getHostContext();
+    const saveCtx = getCurrentChatSaveContext();
+    if (!ctx || !saveCtx || !saveCtx.primaryWorldName) {
+        return { synced: false, changedCount: 0, routeLabel: '', worldName: '' };
+    }
+
+    const worldName = saveCtx.primaryWorldName;
+    const bookConfig = normalizeBookConfig(settings.books?.[worldName]);
+    const chatMessages = Array.isArray(ctx.chat) ? ctx.chat : [];
+
+    let { profile } = getActiveChatBoundProfile(worldName);
+
+    // When swiping floor 0 on a brand-new 1-message chat, re-infer route from the new greeting!
+    const isFreshFloorZeroSwipe = reason === 'floor0-swipe' && chatMessages.length <= 1;
+
+    if (!profile || isFreshFloorZeroSwipe) {
+        const { greetingIndex } = await resolveGreetingCoordinationForBook(worldName, { allowFetchShallow: false });
+        const inferred = inferChatRouteFromMessages({
+            worldName,
+            chatMessages,
+            greetingIndex,
+            bookConfig,
+        });
+        if (inferred) {
+            profile = inferred;
+            saveActiveChatBoundProfile(profile);
+        }
+    }
+
+    if (!profile) {
+        return { synced: false, changedCount: 0, routeLabel: '', worldName };
+    }
+
+    const readRes = await loadWorldbookSummariesUncached(worldName);
+    if (!readRes.ok || readRes.summaries.length === 0) {
+        return { synced: false, changedCount: 0, routeLabel: profile.routeLabel, worldName };
+    }
+
+    const restorePlan = computeChatProfileRestorePlan(readRes.summaries, bookConfig, profile);
+    if (restorePlan.size === 0) {
+        return { synced: true, changedCount: 0, routeLabel: profile.routeLabel, worldName };
+    }
+
+    const writeRes = await applyWorldbookTogglePlan(worldName, restorePlan);
+    if (writeRes.ok && writeRes.changedCount > 0 && !silentToast) {
+        showToast('info', `已按当前存档切换至「${profile.routeLabel}」（同步 ${writeRes.changedCount} 个条目）`);
+    }
+
+    return {
+        synced: Boolean(writeRes.ok),
+        changedCount: writeRes.changedCount || 0,
+        routeLabel: profile.routeLabel,
+        worldName,
+    };
+}
+
+/**
+ * Capture and bind the worldbook's current IF-line / entry state to the active chat save
+ * whenever `worldName` matches the active chat's primary worldbook.
+ *
+ * @param {string} worldName
+ * @param {Array<any>} summaries
+ * @param {{ preferredIfGroupId?: string, customLabel?: string, greetingIndex?: any, force?: boolean }} [opts]
+ */
+export function recordStateIntoActiveChatIfMatching(worldName, summaries, opts = {}) {
+    const cleanWorld = String(worldName ?? '').trim();
+    if (!cleanWorld) return null;
+
+    const settings = getSettings();
+    if (!opts.force && settings.autoSwitchOnChatChange === false) return null;
+
+    const saveCtx = getCurrentChatSaveContext();
+    if (!saveCtx || saveCtx.primaryWorldName !== cleanWorld) return null;
+
+    const bookConfig = normalizeBookConfig(settings.books?.[cleanWorld]);
+    const profile = buildChatProfileFromCurrentState(cleanWorld, summaries, bookConfig, opts);
+    if (!profile) return null;
+
+    saveActiveChatBoundProfile(profile);
+    return profile;
+}
+
+/**
  * Open `worldName` in SillyTavern's native `#WorldInfo` editor and scroll + highlight `uid`.
- * Compatible with hidden character worldbooks and paginated / searched native entry lists.
  *
  * @param {string} worldName
  * @param {string} uid
@@ -569,7 +768,6 @@ export async function locateEntryInNativeEditor(worldName, uid, entryTitle = '')
     const ctx = getHostContext();
     await ensureWorldInfoModule();
 
-    // Expand native WorldInfo drawer if closed
     const drawer = document.getElementById('WorldInfo');
     if (drawer && drawer.classList.contains('closedDrawer')) {
         const icon = document.querySelector('#WI-SP-button .drawer-icon');
@@ -579,8 +777,6 @@ export async function locateEntryInNativeEditor(worldName, uid, entryTitle = '')
     const selectEl = document.getElementById('world_editor_select');
     if (!selectEl) return false;
 
-    // Notify companion worldbook-organizer (if present) that this book is now being edited
-    // so hidden character worldbooks remain attached in `#world_editor_select`.
     const et = ctx?.eventTypes || ctx?.event_types || {};
     if (ctx?.eventSource && et.WORLDINFO_ENTRIES_LOADED && typeof ctx.eventSource.emit === 'function') {
         try {
@@ -594,7 +790,6 @@ export async function locateEntryInNativeEditor(worldName, uid, entryTitle = '')
         (opt) => opt.value !== '' && (opt.textContent || '').trim() === cleanWorld,
     );
 
-    // If `<option>` was temporarily detached by an external filter, attach it using authoritative index
     if (!targetOpt) {
         const allNames = getWorldNames();
         const worldIdx = allNames.indexOf(cleanWorld);
@@ -619,7 +814,6 @@ export async function locateEntryInNativeEditor(worldName, uid, entryTitle = '')
         }
     }
 
-    // Locate `.world_entry[uid="..."]` once rendered; handle active search filter or pagination gracefully
     return await new Promise((resolve) => {
         let tries = 0;
         let triedSearchFallback = false;
@@ -645,8 +839,6 @@ export async function locateEntryInNativeEditor(worldName, uid, entryTitle = '')
                 return;
             }
 
-            // If native editor paginates 200+ entries and our UID is on another page,
-            // use `#world_info_search` with the entry's comment/title once list has loaded entries
             if (!triedSearchFallback && tries >= 4 && list && list.children.length > 0) {
                 const searchInput = document.getElementById('world_info_search');
                 if (searchInput instanceof HTMLInputElement) {

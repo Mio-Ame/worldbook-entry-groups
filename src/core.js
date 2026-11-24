@@ -1,6 +1,6 @@
 /**
  * Worldbook Entry Groups — Pure domain model, IF-line mutex planner,
- * greeting comment coordinator, and prefix/divider auto-grouping engine.
+ * per-chat save route recognizer, greeting comment coordinator, and auto-grouping engine.
  *
  * Zero DOM or browser globals required so every function is deterministic
  * and directly testable in Node.js.
@@ -19,12 +19,14 @@ export const GROUP_MODES = Object.freeze({
 export const VALID_PALETTES = Object.freeze(['paper', 'ink', 'warm', 'sakura', 'host']);
 export const VALID_COLOR_MODES = Object.freeze(['auto', 'light', 'dark']);
 
+const MAX_STORED_CHAT_PROFILES = 120;
+
 const TITLE_TAG_REGEX = /<!---?[\s\u3000]*title[\s\u3000]*[:：][\s\u3000]*(.*?)[\s\u3000]*-?-->/i;
 const DESC_TAG_REGEX = /<!---?[\s\u3000]*desc[\s\u3000]*[:：][\s\u3000]*(.*?)[\s\u3000]*-?-->/i;
 const LORE_TAG_REGEX = /<!---?[\s\u3000]*lore[\s\u3000]*[:：][\s\u3000]*([\d,\s\u3000，]+)[\s\u3000]*-?-->/i;
 const EXCLUDE_TAG_REGEX = /<!---?[\s\u3000]*exclude[\s\u3000]*[:：][\s\u3000]*([\d,\s\u3000，]+)[\s\u3000]*-?-->/i;
 
-const IF_NAME_HINT_REGEX = /(?:^|[\s【\[「(（·\-_/:：|｜])(?:if\s*线?|分支|路线|支线|世界线|结局线|if\d+)(?:$|[\s】\]」)）·\-_/:：|｜\d])/i;
+const IF_NAME_HINT_REGEX = /(?:^|[\s【\[「(（·\-_/:：|｜])(?:if\s*线?|分支|路线|支线|世界线|结局线|if\d+|\d+岁线?)(?:$|[\s】\]」)）·\-_/:：|｜\d])/i;
 
 /**
  * Generate a compact unique group ID.
@@ -86,6 +88,51 @@ export function normalizeBookConfig(raw) {
 }
 
 /**
+ * Normalize a per-chat worldbook route profile (`chatMetadata` or fallback `chatProfiles[chatKey]`).
+ *
+ * @param {any} raw
+ * @returns {{
+ *   worldName: string,
+ *   routeLabel: string,
+ *   ifGroupId: string,
+ *   greetingSwipeIndex: number | null,
+ *   entryDisabledMap: Record<string, boolean>,
+ *   updatedAt: number
+ * } | null}
+ */
+export function normalizeChatProfile(raw) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    const worldName = String(raw.worldName ?? '').trim();
+    if (!worldName) return null;
+
+    const entryDisabledMap = {};
+    if (raw.entryDisabledMap && typeof raw.entryDisabledMap === 'object' && !Array.isArray(raw.entryDisabledMap)) {
+        for (const [uid, dis] of Object.entries(raw.entryDisabledMap)) {
+            const cleanUid = String(uid ?? '').trim();
+            if (!cleanUid) continue;
+            entryDisabledMap[cleanUid] = Boolean(dis);
+        }
+    }
+
+    const ifGroupId = String(raw.ifGroupId ?? '').trim();
+    const routeLabel = String(raw.routeLabel ?? '').trim();
+    const swipeIdx = Number.isInteger(raw.greetingSwipeIndex) && raw.greetingSwipeIndex >= 0
+        ? raw.greetingSwipeIndex
+        : null;
+
+    if (!ifGroupId && Object.keys(entryDisabledMap).length === 0) return null;
+
+    return {
+        worldName,
+        routeLabel,
+        ifGroupId,
+        greetingSwipeIndex: swipeIdx,
+        entryDisabledMap,
+        updatedAt: Number.isFinite(Number(raw.updatedAt)) ? Number(raw.updatedAt) : 0,
+    };
+}
+
+/**
  * Clone a book configuration cleanly for the undo stack.
  * @param {any} bookConfig
  */
@@ -120,6 +167,24 @@ export function normalizeSettings(raw) {
         }
     }
 
+    // Normalize & cap LRU per-chat route bindings
+    const chatProfiles = {};
+    if (src.chatProfiles && typeof src.chatProfiles === 'object' && !Array.isArray(src.chatProfiles)) {
+        const validPairs = [];
+        for (const [chatKey, prof] of Object.entries(src.chatProfiles)) {
+            const cleanKey = String(chatKey ?? '').trim();
+            if (!cleanKey) continue;
+            const normProf = normalizeChatProfile(prof);
+            if (normProf) {
+                validPairs.push([cleanKey, normProf]);
+            }
+        }
+        validPairs.sort((a, b) => (b[1].updatedAt || 0) - (a[1].updatedAt || 0));
+        for (const [k, v] of validPairs.slice(0, MAX_STORED_CHAT_PROFILES)) {
+            chatProfiles[k] = v;
+        }
+    }
+
     return {
         ...src,
         version: 1,
@@ -128,10 +193,41 @@ export function normalizeSettings(raw) {
         showNativeEntryBtn: src.showNativeEntryBtn !== false,
         closeOnLocate: src.closeOnLocate !== false,
         syncGreetingTags: src.syncGreetingTags !== false,
+        autoSwitchOnChatChange: src.autoSwitchOnChatChange !== false,
         searchMultiTerm: Boolean(src.searchMultiTerm),
         lastOpenedBook: String(src.lastOpenedBook ?? '').trim(),
         books,
+        chatProfiles,
     };
+}
+
+/**
+ * Store or update a fallback per-chat route profile inside `settings.chatProfiles` with LRU cap.
+ *
+ * @param {Record<string, any>} settings
+ * @param {string} chatKey
+ * @param {any} rawProfile
+ */
+export function upsertStoredChatProfile(settings, chatKey, rawProfile) {
+    const cleanKey = String(chatKey ?? '').trim();
+    if (!settings || !cleanKey) return;
+    if (!settings.chatProfiles || typeof settings.chatProfiles !== 'object') {
+        settings.chatProfiles = {};
+    }
+    const norm = normalizeChatProfile(rawProfile);
+    if (!norm) {
+        delete settings.chatProfiles[cleanKey];
+        return;
+    }
+    settings.chatProfiles[cleanKey] = norm;
+
+    const keys = Object.keys(settings.chatProfiles);
+    if (keys.length > MAX_STORED_CHAT_PROFILES) {
+        keys.sort((a, b) => (settings.chatProfiles[b]?.updatedAt || 0) - (settings.chatProfiles[a]?.updatedAt || 0));
+        for (const staleKey of keys.slice(MAX_STORED_CHAT_PROFILES)) {
+            delete settings.chatProfiles[staleKey];
+        }
+    }
 }
 
 /**
@@ -146,7 +242,6 @@ export function parseDividerComment(rawComment, meta = {}) {
     const text = String(rawComment ?? '').trim();
     if (!text) return { isDivider: false, label: '' };
 
-    // Explicit decorative line wrappers on one or both sides (2+ symbols)
     const wrappedMatch = text.match(
         /^(?:[=\-—─━═_*~～✦✧★☆◆◇■□▼▽▸▹#]{2,}|【[\s=\-—─━═_*~～]{1,})\s*(.+?)\s*(?:[=\-—─━═_*~～✦✧★☆◆◇■□▼▽◂◃#]{2,}|[\s=\-—─━═_*~～]{1,}】)?$/,
     );
@@ -159,12 +254,10 @@ export function parseDividerComment(rawComment, meta = {}) {
         }
     }
 
-    // Pure symbol line without text (not usable as a named group header)
     if (/^[=\-—─━═_*~～✦✧★☆◆◇■□\s]+$/.test(text)) {
         return { isDivider: false, label: '' };
     }
 
-    // Disabled, empty-body, keyless banner entry such as `【以下是世界观】` or `▼ 校园线 ▼`
     if (meta.disabled && !meta.hasContent && (meta.keyCount || 0) === 0) {
         const bannerClean = text
             .replace(/^(?:以下是|下面是|▼|▽|◆|■|●|▶|▸)\s*/, '')
@@ -184,21 +277,6 @@ export function parseDividerComment(rawComment, meta = {}) {
  * Discards `entry.content` immediately so 200+ entries consume minimal memory on iOS WebViews.
  *
  * @param {any} payload
- * @returns {Array<{
- *   uid: string,
- *   numericUid: number | null,
- *   title: string,
- *   rawComment: string,
- *   keys: string[],
- *   disabled: boolean,
- *   constant: boolean,
- *   vectorized: boolean,
- *   selective: boolean,
- *   order: number,
- *   displayIndex: number,
- *   isDivider: boolean,
- *   dividerLabel: string
- * }>}
  */
 export function extractWorldbookEntrySummaries(payload) {
     const entriesObj = payload?.entries;
@@ -368,12 +446,11 @@ export function buildGroupedView(entries, rawBookConfig) {
 
 /**
  * Filter entries by search query and optional state filter.
- * Supports complete-phrase matching by default (with optional multi-term AND mode).
  *
  * @param {Array<any>} entries
  * @param {string} query
  * @param {{ multiTerm?: boolean, statusFilter?: 'all' | 'enabled' | 'disabled', greetingByUid?: Map<string, any> | null }} [opts]
- * @returns {Set<string>} Set of matching entry UIDs
+ * @returns {Set<string>}
  */
 export function matchEntries(entries, query, { multiTerm = false, statusFilter = 'all', greetingByUid = null } = {}) {
     const list = Array.isArray(entries) ? entries : [];
@@ -410,17 +487,12 @@ export function matchEntries(entries, query, { multiTerm = false, statusFilter =
 
 /**
  * Compute a single-pass batch toggle plan (`Map<uid, nextDisabled>`) when toggling an entire group.
- * - Normal group: enables/disables all entries in the group.
- * - IF-line group (`if_line`): when turning ON, enables all entries in this group AND
- *   disables all entries in every other `if_line` group of the same worldbook!
- * - Radio group (`radio`): when turning OFF, disables all entries in the group;
- *   when turning ON and none are enabled, enables the first entry and disables the rest.
  *
  * @param {Array<any>} entries
  * @param {any} rawBookConfig
  * @param {string} groupId
  * @param {boolean} targetEnabled
- * @returns {Map<string, boolean>} Map of `uid -> nextDisabled`
+ * @returns {Map<string, boolean>}
  */
 export function computeGroupTogglePlan(entries, rawBookConfig, groupId, targetEnabled) {
     const bookConfig = normalizeBookConfig(rawBookConfig);
@@ -461,7 +533,6 @@ export function computeGroupTogglePlan(entries, rawBookConfig, groupId, targetEn
         plan.set(entry.uid, !targetEnabled);
     }
 
-    // Mutually exclusive IF-line groups: enabling one automatically turns off sibling IF-line groups
     if (targetEnabled && targetGroup.mode === GROUP_MODES.IF_LINE) {
         const siblingIfIds = new Set(
             bookConfig.groups
@@ -483,14 +554,12 @@ export function computeGroupTogglePlan(entries, rawBookConfig, groupId, targetEn
 
 /**
  * Compute a single-pass batch toggle plan (`Map<uid, nextDisabled>`) when toggling a single entry.
- * - Inside a `radio` group: turning ON an entry automatically turns OFF other entries in that group.
- * - Inside an `if_line` group: turning ON an entry automatically turns OFF entries in other `if_line` groups.
  *
  * @param {Array<any>} entries
  * @param {any} rawBookConfig
  * @param {string} uid
  * @param {boolean} targetEnabled
- * @returns {Map<string, boolean>} Map of `uid -> nextDisabled`
+ * @returns {Map<string, boolean>}
  */
 export function computeEntryTogglePlan(entries, rawBookConfig, uid, targetEnabled) {
     const bookConfig = normalizeBookConfig(rawBookConfig);
@@ -549,9 +618,6 @@ export function applyTogglePlanToPayload(payload, togglePlan) {
     }
 
     const appliedChanges = [];
-    const values = Array.isArray(entriesObj) ? entriesObj : Object.values(entriesObj);
-
-    // Build fast lookup by `String(entry.uid)` (with fallback to object key)
     const entryByUid = new Map();
     if (Array.isArray(entriesObj)) {
         entriesObj.forEach((entry, idx) => {
@@ -577,7 +643,6 @@ export function applyTogglePlanToPayload(payload, togglePlan) {
         }
     }
 
-    void values;
     return {
         changedCount: appliedChanges.length,
         appliedChanges,
@@ -585,8 +650,24 @@ export function applyTogglePlanToPayload(payload, togglePlan) {
 }
 
 /**
- * Parse greeting HTML comment tags (`<!-- title / desc / lore / exclude -->`)
- * used by greeting-to-worldbook automation scripts.
+ * Strip HTML metadata comments (`<!-- ... -->`), `<greetings>` directory blocks, and collapse whitespace
+ * to build a clean narrative text fingerprint for matching multi-floor chat openings back to card greetings.
+ *
+ * @param {string} rawText
+ * @returns {string}
+ */
+export function buildNarrativeFingerprint(rawText) {
+    const text = String(rawText ?? '');
+    if (!text) return '';
+    return text
+        .replace(/<!--[\s\S]*?-->/g, ' ')
+        .replace(/<greetings>[\s\S]*?<\/greetings>/gi, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+/**
+ * Parse greeting HTML comment tags (`<!-- title / desc / lore / exclude -->`).
  *
  * @param {string} rawText
  * @returns {{ title: string, desc: string, loreUids: string[], excludeUids: string[] }}
@@ -627,51 +708,64 @@ export function parseGreetingCommentTags(rawText) {
 
 /**
  * Build a greeting coordination index from a character's `first_mes` + `alternate_greetings`
- * (or floor-0 chat swipes), mapping which greetings auto-enable or auto-exclude each entry UID.
+ * (ALWAYS preserving the full character-card greeting catalog so branched or multi-floor chats
+ * never lose sibling IF-line `managedUidSet`!).
  *
  * @param {{ firstMes?: string, alternateGreetings?: string[], swipes?: string[], currentSwipeId?: number | null }} source
  */
 export function buildGreetingCoordinationIndex(source = {}) {
-    /** @type {string[]} */
-    let rawGreetings = [];
-    if (Array.isArray(source.swipes) && source.swipes.length > 0) {
-        rawGreetings = source.swipes.map((s) => String(s ?? ''));
-    } else {
-        const first = String(source.firstMes ?? '');
-        const alts = Array.isArray(source.alternateGreetings)
-            ? source.alternateGreetings.map((s) => String(s ?? ''))
-            : [];
-        if (first || alts.length > 0) {
-            rawGreetings = [first, ...alts];
-        }
+    const cardGreetingsRaw = [];
+    const first = String(source.firstMes ?? '');
+    const alts = Array.isArray(source.alternateGreetings)
+        ? source.alternateGreetings.map((s) => String(s ?? ''))
+        : [];
+    if (first || alts.length > 0) {
+        cardGreetingsRaw.push(first, ...alts);
     }
+
+    const swipeRaw = Array.isArray(source.swipes) && source.swipes.length > 0
+        ? source.swipes.map((s) => String(s ?? ''))
+        : [];
+
+    // Prefer full character card greetings when available (branched chats often trim `swipes` to length 1!)
+    const baseList = cardGreetingsRaw.length >= swipeRaw.length && cardGreetingsRaw.length > 0
+        ? cardGreetingsRaw
+        : swipeRaw;
 
     const greetings = [];
     /** @type {Map<string, { includeGreetings: Array<{ swipeIndex: number, label: string, title: string }>, excludeGreetings: Array<{ swipeIndex: number, label: string, title: string }> }>} */
     const byUid = new Map();
     const managedUidSet = new Set();
 
-    rawGreetings.forEach((raw, swipeIndex) => {
-        const parsed = parseGreetingCommentTags(raw);
+    baseList.forEach((raw, swipeIndex) => {
+        // Merge live swipe edits if `swipes[swipeIndex]` exists and carries tags
+        const parsedCard = parseGreetingCommentTags(raw);
+        const parsedSwipe = swipeRaw[swipeIndex] ? parseGreetingCommentTags(swipeRaw[swipeIndex]) : null;
+        const parsed = (parsedSwipe && (parsedSwipe.loreUids.length > 0 || parsedSwipe.excludeUids.length > 0 || parsedSwipe.title))
+            ? parsedSwipe
+            : parsedCard;
+
         const label = `#${swipeIndex}`;
+        const fingerprint = buildNarrativeFingerprint(raw);
         const info = {
             swipeIndex,
             label,
-            title: parsed.title,
-            desc: parsed.desc,
+            title: parsed.title || parsedCard.title,
+            desc: parsed.desc || parsedCard.desc,
             loreUids: parsed.loreUids,
             excludeUids: parsed.excludeUids,
+            fingerprintSlice: fingerprint.slice(0, 140),
         };
         greetings.push(info);
 
-        for (const uid of parsed.loreUids) {
+        for (const uid of info.loreUids) {
             managedUidSet.add(uid);
             if (!byUid.has(uid)) byUid.set(uid, { includeGreetings: [], excludeGreetings: [] });
-            byUid.get(uid).includeGreetings.push({ swipeIndex, label, title: parsed.title });
+            byUid.get(uid).includeGreetings.push({ swipeIndex, label, title: info.title });
         }
-        for (const uid of parsed.excludeUids) {
+        for (const uid of info.excludeUids) {
             if (!byUid.has(uid)) byUid.set(uid, { includeGreetings: [], excludeGreetings: [] });
-            byUid.get(uid).excludeGreetings.push({ swipeIndex, label, title: parsed.title });
+            byUid.get(uid).excludeGreetings.push({ swipeIndex, label, title: info.title });
         }
     });
 
@@ -690,6 +784,269 @@ export function buildGreetingCoordinationIndex(source = {}) {
         currentSwipeId,
         activeGreeting,
     };
+}
+
+/**
+ * Infer which IF-line route / greeting an existing multi-floor chat save belongs to!
+ * Solves the core multi-save pain points:
+ * 1. Reads actual `msg.mes` from newest floor down to floor 0 (supports mid-chat inserted timeline greetings,
+ *    and NEVER falls into the `msg0.swipe_id || 0 -> swipes[0] (#0 目录页)` trap after chatting several floors!).
+ * 2. Even if `<!-- lore: ... -->` comments were stripped from `chat[0].mes`, reverse-matches `chat[0].mes`
+ *    narrative text against the character card's `first_mes` + `alternate_greetings` to recover the exact route!
+ * 3. Uses the character card's full `managedUidSet` so branched saves (`/branch`) cleanly disable sibling IF lines!
+ * 4. Maps matched greeting UIDs or title onto any matching plugin `if_line` group automatically.
+ *
+ * @param {{
+ *   worldName: string,
+ *   chatMessages: Array<{ mes?: string, is_user?: boolean }>,
+ *   greetingIndex: ReturnType<typeof buildGreetingCoordinationIndex> | null,
+ *   bookConfig?: any
+ * }} params
+ * @returns {ReturnType<typeof normalizeChatProfile>}
+ */
+export function inferChatRouteFromMessages({
+    worldName,
+    chatMessages = [],
+    greetingIndex = null,
+    bookConfig = null,
+}) {
+    const cleanWorld = String(worldName ?? '').trim();
+    if (!cleanWorld || !Array.isArray(chatMessages) || chatMessages.length === 0) return null;
+
+    const normBook = normalizeBookConfig(bookConfig);
+    const ifGroups = normBook.groups.filter((g) => g.mode === GROUP_MODES.IF_LINE);
+    const cardGreetings = greetingIndex?.greetings || [];
+    const allManagedUids = greetingIndex?.managedUidSet || new Set();
+
+    let matchedGreeting = null;
+    let inlineParsed = null;
+
+    // 1. Scan non-user messages from newest floor down to floor 0 for explicit `<!-- lore / exclude / title -->`
+    for (let i = chatMessages.length - 1; i >= 0; i -= 1) {
+        const msg = chatMessages[i];
+        if (!msg || msg.is_user) continue;
+        const text = String(msg.mes ?? '');
+        if (!text) continue;
+
+        const parsed = parseGreetingCommentTags(text);
+        if (parsed.loreUids.length > 0 || parsed.excludeUids.length > 0) {
+            inlineParsed = parsed;
+            // Try matching back to a numbered card greeting for friendly title
+            const msgFp = buildNarrativeFingerprint(text).slice(0, 120);
+            matchedGreeting = cardGreetings.find((g) =>
+                (parsed.title && g.title === parsed.title) ||
+                (msgFp.length >= 18 && g.fingerprintSlice && g.fingerprintSlice.startsWith(msgFp.slice(0, 48))),
+            ) || null;
+            break;
+        }
+    }
+
+    // 2. Reverse-match narrative body if `chat[0].mes` (or inserted greeting) lost its HTML comment tags!
+    if (!inlineParsed && cardGreetings.length > 0) {
+        // Check floor 0 first (most common opening), plus any other non-user message that matches a greeting
+        const candidateIndices = [0];
+        for (let i = chatMessages.length - 1; i >= 1; i -= 1) {
+            if (!chatMessages[i]?.is_user) candidateIndices.push(i);
+        }
+        // Prefer latest inserted greeting if any floor > 0 matches a card greeting verbatim; otherwise floor 0
+        for (const floorIdx of [...candidateIndices.slice(1), 0]) {
+            const rawMes = String(chatMessages[floorIdx]?.mes ?? '');
+            const fp = buildNarrativeFingerprint(rawMes);
+            if (fp.length < 16) continue;
+            const probe = fp.slice(0, 80);
+
+            const found = cardGreetings.find((g) => {
+                if (!g.fingerprintSlice || g.fingerprintSlice.length < 16) return false;
+                if (g.loreUids.length === 0 && g.excludeUids.length === 0 && !g.title) return false;
+                return g.fingerprintSlice.startsWith(probe) || fp.startsWith(g.fingerprintSlice.slice(0, 80));
+            });
+            if (found) {
+                matchedGreeting = found;
+                inlineParsed = {
+                    title: found.title,
+                    desc: found.desc,
+                    loreUids: found.loreUids,
+                    excludeUids: found.excludeUids,
+                };
+                break;
+            }
+        }
+    }
+
+    // Also check if floor 0 has a `<!-- title: ... -->` tag matching an IF-line group name even without `lore` UIDs
+    if (!inlineParsed && ifGroups.length > 0 && chatMessages[0] && !chatMessages[0].is_user) {
+        const p0 = parseGreetingCommentTags(String(chatMessages[0].mes ?? ''));
+        const candidateTitle = p0.title;
+        if (candidateTitle) {
+            const matchedGrp = ifGroups.find(
+                (g) => g.name === candidateTitle || g.name.includes(candidateTitle) || candidateTitle.includes(g.name),
+            );
+            if (matchedGrp) {
+                return normalizeChatProfile({
+                    worldName: cleanWorld,
+                    routeLabel: matchedGrp.name,
+                    ifGroupId: matchedGrp.id,
+                    greetingSwipeIndex: null,
+                    entryDisabledMap: {},
+                    updatedAt: Date.now(),
+                });
+            }
+        }
+    }
+
+    if (!inlineParsed) return null;
+
+    const activeSet = new Set(inlineParsed.loreUids);
+    const excludeSet = new Set(inlineParsed.excludeUids);
+    const entryDisabledMap = {};
+
+    // Disable all sibling greeting-managed UIDs not active in this save's greeting, enable active ones!
+    for (const uid of allManagedUids) {
+        const shouldEnable = activeSet.has(uid) && !excludeSet.has(uid);
+        entryDisabledMap[uid] = !shouldEnable;
+    }
+    for (const uid of activeSet) {
+        entryDisabledMap[uid] = excludeSet.has(uid);
+    }
+    for (const uid of excludeSet) {
+        entryDisabledMap[uid] = true;
+    }
+
+    // Check if these active UIDs or title also correspond to one of the user's `if_line` groups
+    let matchedIfGroup = null;
+    if (ifGroups.length > 0) {
+        let bestOverlap = 0;
+        for (const grp of ifGroups) {
+            const grpUids = Object.entries(normBook.assignments)
+                .filter(([, gid]) => gid === grp.id)
+                .map(([u]) => u);
+            const overlap = grpUids.filter((u) => activeSet.has(u)).length;
+            if (overlap > bestOverlap) {
+                bestOverlap = overlap;
+                matchedIfGroup = grp;
+            }
+        }
+        if (!matchedIfGroup && (inlineParsed.title || matchedGreeting?.title)) {
+            const t = (inlineParsed.title || matchedGreeting?.title || '').trim();
+            matchedIfGroup = ifGroups.find((g) => g.name === t || g.name.includes(t) || t.includes(g.name)) || null;
+        }
+    }
+
+    const displayTitle = matchedIfGroup?.name
+        || inlineParsed.title
+        || matchedGreeting?.title
+        || (matchedGreeting ? `开场白 ${matchedGreeting.label}` : '开场白联动路线');
+
+    return normalizeChatProfile({
+        worldName: cleanWorld,
+        routeLabel: displayTitle,
+        ifGroupId: matchedIfGroup?.id || '',
+        greetingSwipeIndex: matchedGreeting ? matchedGreeting.swipeIndex : null,
+        entryDisabledMap,
+        updatedAt: Date.now(),
+    });
+}
+
+/**
+ * Snapshot the current worldbook's IF-line & grouped entry states into a per-chat save profile.
+ * Called automatically when toggling groups in an active chat, or manually via "绑定到当前存档".
+ *
+ * @param {string} worldName
+ * @param {Array<any>} entries
+ * @param {any} rawBookConfig
+ * @param {{ preferredIfGroupId?: string, customLabel?: string, greetingIndex?: any }} [opts]
+ * @returns {ReturnType<typeof normalizeChatProfile>}
+ */
+export function buildChatProfileFromCurrentState(worldName, entries, rawBookConfig, opts = {}) {
+    const cleanWorld = String(worldName ?? '').trim();
+    const list = Array.isArray(entries) ? entries : [];
+    if (!cleanWorld || list.length === 0) return null;
+
+    const bookConfig = normalizeBookConfig(rawBookConfig);
+    const managedGreetingUids = opts.greetingIndex?.managedUidSet || new Set();
+
+    // Determine active IF-line group
+    let activeIfGroup = null;
+    if (opts.preferredIfGroupId) {
+        activeIfGroup = bookConfig.groups.find(
+            (g) => g.id === opts.preferredIfGroupId && g.mode === GROUP_MODES.IF_LINE,
+        ) || null;
+    }
+    if (!activeIfGroup) {
+        const enabledIfGroups = bookConfig.groups.filter((g) => {
+            if (g.mode !== GROUP_MODES.IF_LINE) return false;
+            return list.some((e) => bookConfig.assignments[e.uid] === g.id && !e.disabled);
+        });
+        if (enabledIfGroups.length === 1) {
+            activeIfGroup = enabledIfGroups[0];
+        }
+    }
+
+    // Record states of grouped entries + greeting-managed entries; if neither exists, snapshot all entries
+    const hasAnyGroupOrManaged = Object.keys(bookConfig.assignments).length > 0 || managedGreetingUids.size > 0;
+    const entryDisabledMap = {};
+    for (const entry of list) {
+        if (!hasAnyGroupOrManaged || bookConfig.assignments[entry.uid] || managedGreetingUids.has(entry.uid)) {
+            entryDisabledMap[entry.uid] = Boolean(entry.disabled);
+        }
+    }
+
+    const enabledCount = list.filter((e) => !e.disabled).length;
+    const routeLabel = String(opts.customLabel ?? '').trim()
+        || activeIfGroup?.name
+        || `本档配置（已开 ${enabledCount} 条）`;
+
+    return normalizeChatProfile({
+        worldName: cleanWorld,
+        routeLabel,
+        ifGroupId: activeIfGroup?.id || '',
+        greetingSwipeIndex: null,
+        entryDisabledMap,
+        updatedAt: Date.now(),
+    });
+}
+
+/**
+ * Compute the single-pass `Map<uid, nextDisabled>` needed to restore a chat save's bound profile!
+ *
+ * @param {Array<any>} entries
+ * @param {any} rawBookConfig
+ * @param {any} rawChatProfile
+ * @returns {Map<string, boolean>}
+ */
+export function computeChatProfileRestorePlan(entries, rawBookConfig, rawChatProfile) {
+    const profile = normalizeChatProfile(rawChatProfile);
+    const list = Array.isArray(entries) ? entries : [];
+    const plan = new Map();
+    if (!profile || list.length === 0) return plan;
+
+    const bookConfig = normalizeBookConfig(rawBookConfig);
+    const validUidSet = new Set(list.map((e) => e.uid));
+
+    // 1. Apply bound IF-line group mutex rule first (if group still exists)
+    if (profile.ifGroupId && bookConfig.groups.some((g) => g.id === profile.ifGroupId)) {
+        const groupPlan = computeGroupTogglePlan(list, bookConfig, profile.ifGroupId, true);
+        for (const [uid, nextDisabled] of groupPlan.entries()) {
+            plan.set(uid, nextDisabled);
+        }
+    }
+
+    // 2. Overlay exact recorded entry states for this chat save
+    for (const [uid, nextDisabled] of Object.entries(profile.entryDisabledMap)) {
+        if (validUidSet.has(uid)) {
+            plan.set(uid, Boolean(nextDisabled));
+        }
+    }
+
+    // Prune no-op entries that already match current worldbook state
+    const currentByUid = new Map(list.map((e) => [e.uid, Boolean(e.disabled)]));
+    for (const [uid, nextDisabled] of [...plan.entries()]) {
+        if (currentByUid.get(uid) === nextDisabled) {
+            plan.delete(uid);
+        }
+    }
+
+    return plan;
 }
 
 /**
@@ -723,13 +1080,7 @@ export function looksLikeIfLineName(groupName) {
 }
 
 /**
- * Extract a candidate group prefix from an entry title, e.g.:
- * - `【世界观】王都地理` -> `世界观`
- * - `[IF1·青梅] 初遇` -> `IF1·青梅`
- * - `角色设定 - 外貌` -> `角色设定`
- * - `IF线A：开局` -> `IF线A`
- *
- * Avoids grouping pure bare numbers (`01`, `12`) so numbered flat lists don't collide.
+ * Extract a candidate group prefix from an entry title.
  *
  * @param {string} rawTitle
  * @returns {string | null}
@@ -738,13 +1089,11 @@ export function extractEntryTitlePrefix(rawTitle) {
     let text = String(rawTitle ?? '').trim();
     if (!text) return null;
 
-    // Strip leading pure index badge like `01.` / `1、` when followed by a bracket/prefix
     const strippedIndex = text.replace(/^\d{1,3}[.、)\s]+\s*/, '');
     if (strippedIndex.length >= 3) {
         text = strippedIndex;
     }
 
-    // 1. Leading bracketed prefix: 【前缀】正文 / [前缀]正文 / 「前缀」正文 / （前缀）正文
     const bracketMatch = text.match(/^(?:【([^】]{1,18})】|\[([^\]]{1,18})\]|「([^」]{1,18})」|（([^）]{1,18})）|\(([^)]{1,18})\))\s*(.+)$/);
     if (bracketMatch) {
         const candidate = (bracketMatch[1] || bracketMatch[2] || bracketMatch[3] || bracketMatch[4] || bracketMatch[5] || '').trim();
@@ -753,7 +1102,6 @@ export function extractEntryTitlePrefix(rawTitle) {
         }
     }
 
-    // 2. Delimiter prefix: `前缀 - 正文` / `前缀：正文` / `前缀｜正文` / `前缀_正文`
     const delimMatch = text.match(/^([^:：\-—_｜|/·]{2,16}?)\s*(?:[:：｜|/]|[-—_]{1,2}|·)\s*(.+)$/);
     if (delimMatch) {
         const candidate = delimMatch[1].trim();
@@ -769,15 +1117,6 @@ export function extractEntryTitlePrefix(rawTitle) {
 /**
  * Detect candidate entry groups automatically using divider banners, title prefixes,
  * or greeting `<!-- lore: ... -->` comment tags.
- *
- * @param {Array<any>} entries
- * @param {{
- *   strategy?: 'smart' | 'divider' | 'prefix' | 'greeting',
- *   onlyUngrouped?: boolean,
- *   existingAssignments?: Record<string, string>,
- *   greetingIndex?: ReturnType<typeof buildGreetingCoordinationIndex> | null
- * }} [opts]
- * @returns {Array<{ key: string, name: string, suggestedMode: 'normal' | 'if_line', uids: string[], source: 'greeting' | 'divider' | 'prefix' }>}
  */
 export function detectAutoGroups(entries, {
     strategy = 'smart',
@@ -791,9 +1130,7 @@ export function detectAutoGroups(entries, {
 
     const isEligible = (uid) => !onlyUngrouped || !assignedObj[uid];
 
-    // Helper: Greeting comment tag detection
     const detectFromGreetings = (claimedSet) => {
-        /** @type {Array<{ key: string, name: string, suggestedMode: 'normal' | 'if_line', uids: string[], source: 'greeting' }>} */
         const out = [];
         const greets = greetingIndex?.greetings || [];
         for (const g of greets) {
@@ -814,9 +1151,7 @@ export function detectAutoGroups(entries, {
         return out;
     };
 
-    // Helper: Divider section detection (walks entries in natural display order)
     const detectFromDividers = (claimedSet) => {
-        /** @type {Array<{ label: string, uids: string[] }>} */
         const rawBlocks = [];
         let currentBlock = null;
 
@@ -837,11 +1172,9 @@ export function detectAutoGroups(entries, {
             }
         }
 
-        // Require at least 2 meaningful divider sections (with >= 2 entries or >1 non-empty section)
         const meaningful = rawBlocks.filter((b) => b.uids.length >= 1);
         if (meaningful.length < 2) return [];
 
-        /** @type {Map<string, string[]>} */
         const mergedByLabel = new Map();
         for (const b of meaningful) {
             if (!mergedByLabel.has(b.label)) mergedByLabel.set(b.label, []);
@@ -864,9 +1197,7 @@ export function detectAutoGroups(entries, {
         return out;
     };
 
-    // Helper: Title prefix clustering (>= 2 entries sharing the same prefix)
     const detectFromPrefixes = (claimedSet) => {
-        /** @type {Map<string, string[]>} */
         const buckets = new Map();
         for (const entry of list) {
             if (entry.isDivider) continue;
@@ -880,7 +1211,6 @@ export function detectAutoGroups(entries, {
         const out = [];
         let idx = 0;
         for (const [prefix, uids] of buckets.entries()) {
-            // Allow 1-entry group ONLY if it explicitly looks like an IF branch (e.g. `[IF3] 隐藏结局`)
             if (uids.length < 2 && !looksLikeIfLineName(prefix)) continue;
             for (const uid of uids) claimedSet.add(uid);
             out.push({
@@ -895,18 +1225,10 @@ export function detectAutoGroups(entries, {
     };
 
     const claimed = new Set();
-    if (strategy === 'greeting') {
-        return detectFromGreetings(claimed);
-    }
-    if (strategy === 'divider') {
-        return detectFromDividers(claimed);
-    }
-    if (strategy === 'prefix') {
-        return detectFromPrefixes(claimed);
-    }
+    if (strategy === 'greeting') return detectFromGreetings(claimed);
+    if (strategy === 'divider') return detectFromDividers(claimed);
+    if (strategy === 'prefix') return detectFromPrefixes(claimed);
 
-    // Smart combined strategy:
-    // 1) Greeting IF-line tags (if present) -> 2) Divider sections -> 3) Prefix clusters on remaining entries
     const results = [];
     if (greetingIndex?.hasManagedEntries) {
         results.push(...detectFromGreetings(claimed));
@@ -918,11 +1240,6 @@ export function detectAutoGroups(entries, {
 
 /**
  * Apply selected auto-detected group proposals into a bookConfig cleanly.
- * Merges into an existing group if one with the exact same name already exists!
- *
- * @param {any} rawBookConfig
- * @param {Array<{ name: string, suggestedMode?: 'normal' | 'if_line' | 'radio', mode?: 'normal' | 'if_line' | 'radio', uids: string[] }>} proposals
- * @param {{ replaceExisting?: boolean }} [opts]
  */
 export function applyAutoGroupProposals(rawBookConfig, proposals, { replaceExisting = false } = {}) {
     const next = replaceExisting
@@ -959,12 +1276,12 @@ export function applyAutoGroupProposals(rawBookConfig, proposals, { replaceExist
 }
 
 /**
- * Migrate plugin settings when `worldbook-organizer` renames a worldbook (`wbo:worldbook-renamed`).
+ * Migrate plugin settings (and per-chat route profiles) when `worldbook-organizer` renames a worldbook.
  *
  * @param {Record<string, any>} settings
  * @param {string} oldName
  * @param {string} newName
- * @returns {boolean} True if settings were updated
+ * @returns {boolean}
  */
 export function migrateSettingsOnWorldRename(settings, oldName, newName) {
     const cleanOld = String(oldName ?? '').trim();
@@ -976,7 +1293,6 @@ export function migrateSettingsOnWorldRename(settings, oldName, newName) {
         if (!settings.books[cleanNew]) {
             settings.books[cleanNew] = settings.books[cleanOld];
         } else {
-            // Merge without losing existing groups on newName
             const merged = cloneBookConfig(settings.books[cleanNew]);
             const oldCfg = normalizeBookConfig(settings.books[cleanOld]);
             for (const g of oldCfg.groups) {
@@ -997,6 +1313,15 @@ export function migrateSettingsOnWorldRename(settings, oldName, newName) {
         changed = true;
     }
 
+    if (settings.chatProfiles && typeof settings.chatProfiles === 'object') {
+        for (const prof of Object.values(settings.chatProfiles)) {
+            if (prof && prof.worldName === cleanOld) {
+                prof.worldName = cleanNew;
+                changed = true;
+            }
+        }
+    }
+
     if (settings.lastOpenedBook === cleanOld) {
         settings.lastOpenedBook = cleanNew;
         changed = true;
@@ -1006,18 +1331,19 @@ export function migrateSettingsOnWorldRename(settings, oldName, newName) {
 }
 
 /**
- * Clean up plugin settings when `worldbook-organizer` deletes worldbooks (`wbo:worldbook-deleted`).
+ * Clean up plugin settings (and per-chat route profiles) when worldbooks are deleted.
  *
  * @param {Record<string, any>} settings
  * @param {string[]} deletedNames
- * @returns {boolean} True if settings were updated
+ * @returns {boolean}
  */
 export function removeDeletedWorldsFromSettings(settings, deletedNames) {
     if (!settings || !Array.isArray(deletedNames) || deletedNames.length === 0) return false;
+    const delSet = new Set(deletedNames.map((n) => String(n ?? '').trim()).filter(Boolean));
+    if (delSet.size === 0) return false;
+
     let changed = false;
-    for (const rawName of deletedNames) {
-        const clean = String(rawName ?? '').trim();
-        if (!clean) continue;
+    for (const clean of delSet) {
         if (settings.books && typeof settings.books === 'object' && clean in settings.books) {
             delete settings.books[clean];
             changed = true;
@@ -1027,5 +1353,15 @@ export function removeDeletedWorldsFromSettings(settings, deletedNames) {
             changed = true;
         }
     }
+
+    if (settings.chatProfiles && typeof settings.chatProfiles === 'object') {
+        for (const [chatKey, prof] of Object.entries(settings.chatProfiles)) {
+            if (prof && delSet.has(prof.worldName)) {
+                delete settings.chatProfiles[chatKey];
+                changed = true;
+            }
+        }
+    }
+
     return changed;
 }

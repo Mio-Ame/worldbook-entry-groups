@@ -3,8 +3,10 @@
  *
  * Lifecycle guarantees:
  * - Zero polling & zero background worldbook scanning.
- * - Coordinates with companion `worldbook-organizer` (`wbo:worldbook-renamed` / `wbo:worldbook-deleted`)
- *   and greeting-based lore automation (`MESSAGE_SWIPED` / `CHARACTER_MESSAGE_RENDERED` / `CHAT_CHANGED`).
+ * - Per-chat save route recognition & auto-switching (`CHAT_CHANGED` + floor-0 `MESSAGE_SWIPED`):
+ *   runs after external floor-0 scripts settle so multi-floor & branched chat saves always
+ *   restore their true IF-line / entry state cleanly.
+ * - Coordinates with companion `worldbook-organizer` (`wbo:worldbook-renamed` / `wbo:worldbook-deleted`).
  * - Deterministic cleanup (`onDisable` / `onClean`) removes all listeners, observers, and DOM mounts.
  */
 
@@ -19,7 +21,7 @@ import {
     getSettings,
     isWithinSelfWriteWindow,
     saveSettings,
-    showToast,
+    syncWorldbookForActiveChat,
     waitForTauriReadyIfPresent,
 } from './src/host.js';
 import {
@@ -35,11 +37,12 @@ import {
     teardownPanels,
 } from './src/panel.js';
 
-const STYLE_ASSET_VERSION = '0.1.0';
+const STYLE_ASSET_VERSION = '0.2.0';
 
 let _initialized = false;
 let _nativeMountObserver = null;
 let _greetingSyncTimer = null;
+let _chatSwitchSyncTimer = null;
 /** @type {Array<{ event: string, handler: Function }>} */
 const _boundHostEvents = [];
 let _onWboRenamed = null;
@@ -87,16 +90,11 @@ function trackHostEvent(eventSource, eventName, handler) {
 }
 
 /**
- * Debounced post-greeting-swipe refresh: waits until greeting lore automation finishes
- * its async `setLorebookEntries` write (~10–350ms), then silently refreshes the open modal
- * so entry toggles and active greeting badges stay 100% synchronized.
- *
+ * Debounced refresh for open modal when worldbook state is modified externally.
  * @param {number} [delayMs=480]
  */
-function scheduleGreetingCoordinationSync(delayMs = 480) {
+function scheduleOpenModalSync(delayMs = 480) {
     if (!isEntryGroupsModalOpen()) return;
-    const settings = getSettings();
-    if (settings.syncGreetingTags === false) return;
 
     clearTimeout(_greetingSyncTimer);
     _greetingSyncTimer = setTimeout(() => {
@@ -107,7 +105,39 @@ function scheduleGreetingCoordinationSync(delayMs = 480) {
         const openBook = getCurrentModalWorldName();
         const activeCharBook = getCurrentCharacterPrimaryWorldName();
         if (openBook && (!activeCharBook || openBook === activeCharBook)) {
-            void refreshOpenModalBook({ silent: true, reason: 'greeting-sync' });
+            void refreshOpenModalBook({ silent: true, reason: 'external-sync' });
+        }
+    }, delayMs);
+}
+
+/**
+ * Debounced per-chat save route recognition & worldbook switch.
+ * Runs at ~650ms on `CHAT_CHANGED` (deliberately AFTER floor-0 scripts' 300ms timer!)
+ * so multi-floor or branched saves never stay stuck on another save's IF line.
+ *
+ * @param {'chat-changed' | 'floor0-swipe'} reason
+ * @param {number} delayMs
+ */
+function scheduleChatSaveRouteSync(reason, delayMs) {
+    clearTimeout(_chatSwitchSyncTimer);
+    _chatSwitchSyncTimer = setTimeout(async () => {
+        _chatSwitchSyncTimer = null;
+        if (!_initialized) return;
+        const settings = getSettings();
+        if (settings.autoSwitchOnChatChange === false) {
+            if (isEntryGroupsModalOpen()) {
+                void refreshOpenModalBook({ silent: true, reason });
+            }
+            return;
+        }
+
+        await syncWorldbookForActiveChat({
+            reason,
+            silentToast: reason === 'floor0-swipe',
+        });
+
+        if (_initialized && isEntryGroupsModalOpen()) {
+            void refreshOpenModalBook({ silent: true, reason });
         }
     }, delayMs);
 }
@@ -227,7 +257,6 @@ export async function init() {
         }
     }
 
-    // Host lifecycle & greeting coordination listeners (zero per-token or unrelated message overhead)
     const eventSource = ctx.eventSource;
     const et = ctx.eventTypes || ctx.event_types || {};
 
@@ -249,7 +278,7 @@ export async function init() {
     trackHostEvent(eventSource, et.WORLDINFO_SETTINGS_UPDATED, () => {
         syncToolbarIdle();
         if (isEntryGroupsModalOpen() && !isWithinSelfWriteWindow()) {
-            scheduleGreetingCoordinationSync(380);
+            scheduleOpenModalSync(380);
         }
     });
     trackHostEvent(eventSource, et.WORLDINFO_ENTRIES_LOADED, syncToolbarIdle);
@@ -257,29 +286,30 @@ export async function init() {
         if (!isEntryGroupsModalOpen() || isWithinSelfWriteWindow()) return;
         const openBook = getCurrentModalWorldName();
         if (!worldName || String(worldName).trim() === openBook) {
-            scheduleGreetingCoordinationSync(320);
+            scheduleOpenModalSync(320);
         }
     });
 
-    // Coordinate with floor-0 greeting swipe / initial greeting render / chat switch
+    // Floor-0 greeting swipe: record newly picked route for a fresh 1-message save & sync modal
     trackHostEvent(eventSource, et.MESSAGE_SWIPED, (msgId) => {
         if (Number(msgId) === 0 || msgId === undefined) {
-            scheduleGreetingCoordinationSync(480);
+            scheduleChatSaveRouteSync('floor0-swipe', 520);
         }
     });
     trackHostEvent(eventSource, et.CHARACTER_MESSAGE_RENDERED, (msgId) => {
         if (Number(msgId) === 0) {
-            scheduleGreetingCoordinationSync(480);
+            scheduleOpenModalSync(480);
         }
     });
+
+    // Chat save switch (`CHAT_CHANGED`): restore this save's bound or inferred IF-line state!
     trackHostEvent(eventSource, et.CHAT_CHANGED, () => {
         syncToolbarIdle();
-        scheduleGreetingCoordinationSync(550);
+        scheduleChatSaveRouteSync('chat-changed', 650);
     });
 
     registerSlashCommand(ctx);
     ensureFreshStylesheet();
-    void showToast;
 }
 
 export async function onActivate() {
@@ -292,6 +322,8 @@ export async function onActivate() {
 export function onDisable() {
     clearTimeout(_greetingSyncTimer);
     _greetingSyncTimer = null;
+    clearTimeout(_chatSwitchSyncTimer);
+    _chatSwitchSyncTimer = null;
 
     if (_nativeMountObserver) {
         _nativeMountObserver.disconnect();

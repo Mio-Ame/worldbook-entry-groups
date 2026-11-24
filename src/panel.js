@@ -1,9 +1,10 @@
 /**
- * Worldbook Entry Groups — Standalone fixed-size panel, native shortcut button,
- * floating action menu, and sub-modals (group editor, auto-detect preview, batch move, settings).
+ * Worldbook Entry Groups — Standalone fixed-size panel, per-chat save route bar,
+ * native shortcut button, floating action menu, and sub-modals.
  *
  * UX & stability guarantees:
  * - Fixed desktop dimensions (never grows/shrinks on search, tab/subview switch, or group collapse).
+ * - Constant save-binding bar shows which IF line the current chat save is locked to.
  * - Transparent backdrop that never darkens SillyTavern's main screen; outside click never closes.
  * - Mobile safe-area fullscreen layout, single-line rows (`toggle + ···`), no auto `.focus()` on touch/narrow viewports.
  * - Releases in-memory entry summaries immediately upon modal close.
@@ -31,13 +32,17 @@ import {
     applyWorldbookTogglePlan,
     copyTextToClipboard,
     detectHostColorScheme,
+    getActiveChatBoundProfile,
     getPreferredDefaultBook,
     getSettings,
     getWorldNames,
     locateEntryInNativeEditor,
     loadWorldbookSummariesUncached,
+    recordStateIntoActiveChatIfMatching,
     resolveGreetingCoordinationForBook,
+    saveActiveChatBoundProfile,
     showToast,
+    syncWorldbookForActiveChat,
 } from './host.js';
 
 const NATIVE_BTN_ID = 'weg-native-entry-btn';
@@ -69,14 +74,9 @@ const _selectedUids = new Set();
 /** @type {Map<string, Array<any>>} bookName -> undo snapshots */
 const _undoStacks = new Map();
 
-// Submodal state (`null` | `{ type: 'group-form' | 'batch-move' | 'auto-detect' | 'settings' | 'confirm-clear', ... }`)
 let _submodal = null;
-
-// Dragging state for desktop modal header
 let _dragOffset = { x: 0, y: 0 };
 let _dragCleanup = null;
-
-// Floating menu cleanup
 let _floatingMenuCleanup = null;
 
 function esc(val) {
@@ -158,7 +158,6 @@ function popUndoSnapshot(worldName) {
 
 /**
  * Mount the theme-following shortcut button into SillyTavern's native `#world_popup` toolbar row.
- * Aligns exact height, border, radius, and icon sizing with native sibling buttons.
  */
 export function ensureNativeShortcutButton() {
     if (typeof document === 'undefined') return null;
@@ -175,7 +174,7 @@ export function ensureNativeShortcutButton() {
     btn.className = 'menu_button fa-solid fa-fw fa-layer-group weg-native-entry-btn';
     btn.tabIndex = 0;
     btn.setAttribute('role', 'button');
-    btn.title = '世界书条目分组（整组开关 / IF 线互斥 / 快速定位）';
+    btn.title = '世界书条目分组（整组开关 / IF 线切档记忆 / 快速定位）';
 
     if (importBtn && importBtn.parentElement === editorRow) {
         editorRow.insertBefore(btn, importBtn);
@@ -183,7 +182,6 @@ export function ensureNativeShortcutButton() {
         editorRow.appendChild(btn);
     }
 
-    // Match native sibling icon-button geometry to prevent toolbar jitter
     requestAnimationFrame(() => {
         if (!btn || !btn.isConnected) return;
         const ref = importBtn || editorRow.querySelector('.menu_button:not(#weg-native-entry-btn)');
@@ -212,9 +210,6 @@ export function ensureNativeShortcutButton() {
     return btn;
 }
 
-/**
- * Sync visibility of the native shortcut button according to user settings.
- */
 export function syncNativeShortcutButton() {
     if (typeof document === 'undefined') return;
     const btn = document.getElementById(NATIVE_BTN_ID);
@@ -231,9 +226,6 @@ export function getCurrentModalWorldName() {
     return _isOpen ? _currentBook : '';
 }
 
-/**
- * Apply active palette and light/dark mode classes to the modal root.
- */
 function applyModalThemeAttributes(modalEl) {
     if (!modalEl) return;
     const settings = getSettings();
@@ -246,9 +238,6 @@ function applyModalThemeAttributes(modalEl) {
     modalEl.classList.toggle('weg-theme-dark', resolvedScheme !== 'light');
 }
 
-/**
- * Close any open floating `···` menu cleanly.
- */
 function closeFloatingMenu() {
     if (_floatingMenuCleanup) {
         _floatingMenuCleanup();
@@ -260,11 +249,7 @@ function closeFloatingMenu() {
 }
 
 /**
- * Open a compact floating menu anchored to `anchorEl`, flipping upward near bottom edges
- * and clamping horizontally inside viewport bounds.
- *
- * @param {HTMLElement} anchorEl
- * @param {Array<{ label: string, icon?: string, danger?: boolean, disabled?: boolean, onClick: () => void }>} items
+ * Open a compact floating menu anchored to `anchorEl`, flipping upward near bottom edges.
  */
 function openFloatingMenu(anchorEl, items) {
     closeFloatingMenu();
@@ -294,7 +279,6 @@ function openFloatingMenu(anchorEl, items) {
 
     document.body.appendChild(menu);
 
-    // Measure & clamp inside viewport without `!important` width overrides
     const anchorRect = anchorEl.getBoundingClientRect();
     const menuRect = menu.getBoundingClientRect();
     const vw = window.innerWidth;
@@ -340,8 +324,6 @@ function openFloatingMenu(anchorEl, items) {
 
 /**
  * Load entry summaries + greeting coordination for `worldName` into the open modal.
- * @param {string} worldName
- * @param {{ silent?: boolean, preserveSelection?: boolean }} [opts]
  */
 async function loadBookIntoModal(worldName, { silent = false, preserveSelection = false } = {}) {
     const clean = String(worldName ?? '').trim();
@@ -377,7 +359,6 @@ async function loadBookIntoModal(worldName, { silent = false, preserveSelection 
             : Promise.resolve({ characterName: '', greetingIndex: null }),
     ]);
 
-    // Guard against out-of-order async completion if user switched books rapidly
     if (!_isOpen || _currentBook !== clean) return;
 
     _loadingBook = false;
@@ -393,8 +374,8 @@ async function loadBookIntoModal(worldName, { silent = false, preserveSelection 
     _loadedSummaries = bookRes.summaries;
     _greetingCharName = greetRes.characterName || '';
     _greetingIndex = greetRes.greetingIndex || null;
+    void _greetingCharName;
 
-    // Cleanly prune stale deleted entry UIDs from plugin settings so counts never drift
     const curSettings = getSettings();
     if (curSettings.books?.[clean]) {
         const validSet = new Set(_loadedSummaries.map((e) => e.uid));
@@ -404,7 +385,6 @@ async function loadBookIntoModal(worldName, { silent = false, preserveSelection 
         }
     }
 
-    // Keep `_selectedUids` restricted to still-existing UIDs
     if (_selectedUids.size > 0) {
         const validSet = new Set(_loadedSummaries.map((e) => e.uid));
         for (const uid of [..._selectedUids]) {
@@ -415,18 +395,11 @@ async function loadBookIntoModal(worldName, { silent = false, preserveSelection 
     renderModalContents();
 }
 
-/**
- * Refresh the currently open worldbook in place (e.g. after greeting swipe or manual refresh button).
- * @param {{ silent?: boolean, reason?: string }} [opts]
- */
 export async function refreshOpenModalBook({ silent = false } = {}) {
     if (!_isOpen || !_currentBook || _writingToggle) return;
     await loadBookIntoModal(_currentBook, { silent, preserveSelection: true });
 }
 
-/**
- * React to `wbo:worldbook-renamed` while modal is open or closed.
- */
 export function handleExternalWorldbookRenamed(oldName, newName) {
     if (_undoStacks.has(oldName)) {
         _undoStacks.set(newName, _undoStacks.get(oldName));
@@ -440,9 +413,6 @@ export function handleExternalWorldbookRenamed(oldName, newName) {
     }
 }
 
-/**
- * React to `wbo:worldbook-deleted` while modal is open or closed.
- */
 export function handleExternalWorldbookDeleted(deletedNames) {
     const delSet = new Set((deletedNames || []).map((n) => String(n ?? '').trim()).filter(Boolean));
     for (const name of delSet) {
@@ -469,7 +439,6 @@ function ensureModalShell() {
     backdrop.className = 'weg-modal-backdrop';
     applyTauriSurface(backdrop, 'backdrop');
 
-    // Explicitly block outside-click accidental dismissal (`AGENTS.md` redline)
     backdrop.addEventListener('click', (ev) => {
         if (ev.target === backdrop) {
             ev.stopPropagation();
@@ -523,6 +492,8 @@ function ensureModalShell() {
             </div>
         </div>
 
+        <div class="weg-save-bar" id="weg-save-bar"></div>
+
         <main class="weg-body" id="weg-body"></main>
 
         <footer class="weg-footer" id="weg-footer"></footer>
@@ -539,9 +510,6 @@ function ensureModalShell() {
     return backdrop;
 }
 
-/**
- * Enable smooth title-bar dragging on desktop viewports without letting the header leave the screen.
- */
 function setupDesktopDragging(modal) {
     if (_dragCleanup) {
         _dragCleanup();
@@ -596,9 +564,6 @@ function setupDesktopDragging(modal) {
     };
 }
 
-/**
- * Bind permanent top-level shell controls (toolbar, search with IME composition protection, delegated list clicks).
- */
 function wireShellEvents(modal) {
     const closeBtn = modal.querySelector('#weg-btn-close');
     const newGroupBtn = modal.querySelector('#weg-btn-new-group');
@@ -609,6 +574,7 @@ function wireShellEvents(modal) {
     const searchInput = modal.querySelector('#weg-search-input');
     const searchClearBtn = modal.querySelector('#weg-search-clear');
     const statusSelect = modal.querySelector('#weg-status-select');
+    const saveBarEl = modal.querySelector('#weg-save-bar');
     const bodyEl = modal.querySelector('#weg-body');
     const footerEl = modal.querySelector('#weg-footer');
 
@@ -646,7 +612,6 @@ function wireShellEvents(modal) {
         void loadBookIntoModal(_currentBook, { silent: false, preserveSelection: true });
     });
 
-    // IME-safe search box (`compositionstart` / `compositionend` per `AGENTS.md`)
     if (searchInput instanceof HTMLInputElement) {
         searchInput.addEventListener('compositionstart', () => {
             _isComposing = true;
@@ -685,12 +650,47 @@ function wireShellEvents(modal) {
         renderBodyAndFooterOnly();
     });
 
-    // Delegated body interactions
+    // Per-chat save bar actions (lock current switches / auto-infer from chat floors / unbind)
+    saveBarEl?.addEventListener('click', async (ev) => {
+        const target = ev.target instanceof Element ? ev.target : null;
+        if (!target) return;
+        const btn = target.closest('[data-weg-save-action]');
+        if (!(btn instanceof HTMLElement) || btn.hasAttribute('disabled')) return;
+
+        const action = btn.getAttribute('data-weg-save-action');
+        if (action === 'bind-current') {
+            if (!_currentBook || _loadedSummaries.length === 0) return;
+            const prof = recordStateIntoActiveChatIfMatching(_currentBook, _loadedSummaries, {
+                greetingIndex: _greetingIndex,
+                force: true,
+            });
+            if (prof) {
+                renderBodyAndFooterOnly();
+                showToast('success', `已将「${prof.routeLabel}」绑定到当前聊天存档，切回此档时将自动恢复`);
+            }
+        } else if (action === 'auto-recognize-chat') {
+            if (!_currentBook) return;
+            // Clear stale binding first so `syncWorldbookForActiveChat` re-infers cleanly from chat floors
+            saveActiveChatBoundProfile(null);
+            const res = await syncWorldbookForActiveChat({ reason: 'manual', silentToast: true });
+            if (res.routeLabel) {
+                await loadBookIntoModal(_currentBook, { silent: true, preserveSelection: true });
+                showToast('success', `已从当前聊天内容识别并切换至「${res.routeLabel}」`);
+            } else {
+                renderBodyAndFooterOnly();
+                showToast('info', '当前聊天未检测到开场白联动标记，可直接打开目标 IF 线分组自动锁档');
+            }
+        } else if (action === 'unbind-current') {
+            saveActiveChatBoundProfile(null);
+            renderBodyAndFooterOnly();
+            showToast('info', '已解除当前聊天存档的路线绑定');
+        }
+    });
+
     bodyEl?.addEventListener('click', (ev) => {
         const target = ev.target instanceof Element ? ev.target : null;
         if (!target) return;
 
-        // 1. Group main switch
         const grpToggle = target.closest('[data-weg-group-toggle]');
         if (grpToggle instanceof HTMLElement) {
             ev.stopPropagation();
@@ -700,7 +700,6 @@ function wireShellEvents(modal) {
             return;
         }
 
-        // 2. Group `···` menu button
         const grpMenuBtn = target.closest('[data-weg-group-menu]');
         if (grpMenuBtn instanceof HTMLElement) {
             ev.stopPropagation();
@@ -709,7 +708,6 @@ function wireShellEvents(modal) {
             return;
         }
 
-        // 3. Group collapse/expand header click
         const grpHeader = target.closest('[data-weg-group-header]');
         if (grpHeader instanceof HTMLElement) {
             const groupId = grpHeader.getAttribute('data-weg-group-header') || '';
@@ -717,7 +715,6 @@ function wireShellEvents(modal) {
             return;
         }
 
-        // 4. Entry main switch
         const entryToggle = target.closest('[data-weg-entry-toggle]');
         if (entryToggle instanceof HTMLElement) {
             ev.stopPropagation();
@@ -727,7 +724,6 @@ function wireShellEvents(modal) {
             return;
         }
 
-        // 5. Entry `···` menu button
         const entryMenuBtn = target.closest('[data-weg-entry-menu]');
         if (entryMenuBtn instanceof HTMLElement) {
             ev.stopPropagation();
@@ -736,7 +732,6 @@ function wireShellEvents(modal) {
             return;
         }
 
-        // 6. Entry row click in batch-selection mode
         const entryRow = target.closest('[data-weg-entry-row]');
         if (_batchMode && entryRow instanceof HTMLElement) {
             const uid = entryRow.getAttribute('data-weg-entry-row') || '';
@@ -747,7 +742,6 @@ function wireShellEvents(modal) {
         }
     });
 
-    // Delegated footer interactions
     footerEl?.addEventListener('click', (ev) => {
         const target = ev.target instanceof Element ? ev.target : null;
         if (!target) return;
@@ -779,10 +773,6 @@ function wireShellEvents(modal) {
     });
 }
 
-/**
- * Open the standalone entry-group manager modal.
- * @param {{ worldName?: string }} [opts]
- */
 export async function openEntryGroupsModal(opts = {}) {
     if (typeof document === 'undefined') return;
     const settings = getSettings();
@@ -812,7 +802,6 @@ export async function openEntryGroupsModal(opts = {}) {
 
     await loadBookIntoModal(targetBook, { silent: false, preserveSelection: false });
 
-    // Auto-focus search ONLY on desktop wide viewports (NEVER on mobile / iOS WKWebView!)
     if (!isNarrowViewport()) {
         const searchInput = backdrop.querySelector('#weg-search-input');
         if (searchInput instanceof HTMLInputElement) {
@@ -821,9 +810,6 @@ export async function openEntryGroupsModal(opts = {}) {
     }
 }
 
-/**
- * Close the modal and immediately release session entry summaries for mobile RAM safety.
- */
 export function closeEntryGroupsModal() {
     closeFloatingMenu();
     _submodal = null;
@@ -851,9 +837,6 @@ export function closeEntryGroupsModal() {
     }
 }
 
-/**
- * Full teardown when the extension is disabled or cleaned up.
- */
 export function teardownPanels() {
     closeEntryGroupsModal();
     if (_dragCleanup) {
@@ -867,9 +850,6 @@ export function teardownPanels() {
     }
 }
 
-/**
- * Toggle collapse state of a single group section.
- */
 function toggleGroupCollapse(groupId) {
     if (!_currentBook) return;
     const settings = getSettings();
@@ -886,9 +866,6 @@ function toggleGroupCollapse(groupId) {
     renderBodyAndFooterOnly();
 }
 
-/**
- * Expand all groups if most/all are collapsed, otherwise collapse all groups.
- */
 function toggleCollapseAllGroups() {
     if (!_currentBook) return;
     const settings = getSettings();
@@ -903,9 +880,6 @@ function toggleCollapseAllGroups() {
     renderBodyAndFooterOnly();
 }
 
-/**
- * Undo the most recent structural group edit on the current worldbook.
- */
 function handleUndoLastGroupChange() {
     if (!_currentBook) return;
     const prev = popUndoSnapshot(_currentBook);
@@ -917,39 +891,54 @@ function handleUndoLastGroupChange() {
 }
 
 /**
- * Execute a single-write batch toggle for an entire group (including IF-line mutual exclusion).
+ * Execute a single-write batch toggle for an entire group AND auto-bind to the active chat save!
  */
-async function handleGroupToggle(groupId, targetEnabled) {
+async function handleGroupToggle(groupId, targetEnabled, { forceBindChat = false } = {}) {
     if (!_currentBook || _writingToggle || _loadingBook) return;
     const settings = getSettings();
     const bookCfg = getBookConfigMutable(settings, _currentBook);
     const plan = computeGroupTogglePlan(_loadedSummaries, bookCfg, groupId, targetEnabled);
-    if (plan.size === 0) return;
-
-    _writingToggle = true;
-    renderBodyAndFooterOnly();
 
     const targetBook = _currentBook;
-    const res = await applyWorldbookTogglePlan(targetBook, plan);
-    _writingToggle = false;
+    const grp = bookCfg.groups.find((g) => g.id === groupId);
 
-    if (!_isOpen || _currentBook !== targetBook) return;
-    if (!res.ok) {
-        showToast('error', res.error || '切换整组开关失败');
+    if (plan.size > 0) {
+        _writingToggle = true;
         renderBodyAndFooterOnly();
-        return;
+
+        const res = await applyWorldbookTogglePlan(targetBook, plan);
+        _writingToggle = false;
+
+        if (!_isOpen || _currentBook !== targetBook) return;
+        if (!res.ok) {
+            showToast('error', res.error || '切换整组开关失败');
+            renderBodyAndFooterOnly();
+            return;
+        }
+        _loadedSummaries = res.summaries;
     }
 
-    _loadedSummaries = res.summaries;
-    const grp = bookCfg.groups.find((g) => g.id === groupId);
+    // Automatically remember the new IF-line / group state on the active chat save!
+    const bound = recordStateIntoActiveChatIfMatching(targetBook, _loadedSummaries, {
+        preferredIfGroupId: grp?.mode === GROUP_MODES.IF_LINE && targetEnabled ? grp.id : '',
+        customLabel: grp?.mode === GROUP_MODES.IF_LINE && targetEnabled ? grp.name : '',
+        greetingIndex: _greetingIndex,
+        force: forceBindChat,
+    });
+
     if (grp?.mode === GROUP_MODES.IF_LINE && targetEnabled) {
-        showToast('success', `已切换至「${grp.name}」，其余 IF 线已自动关闭`);
+        showToast(
+            'success',
+            bound
+                ? `已切换至「${grp.name}」并记住到当前存档`
+                : `已切换至「${grp.name}」，其余 IF 线已自动关闭`,
+        );
     }
     renderModalContents();
 }
 
 /**
- * Execute a single-write toggle for one entry (respecting radio / IF-line group rules).
+ * Execute a single-write toggle for one entry AND keep the active chat save binding updated!
  */
 async function handleEntryToggle(uid, targetEnabled) {
     if (!_currentBook || _writingToggle || _loadingBook) return;
@@ -973,12 +962,15 @@ async function handleEntryToggle(uid, targetEnabled) {
     }
 
     _loadedSummaries = res.summaries;
+
+    // Keep active chat save's entry state snapshot fresh if bound or auto-switching
+    recordStateIntoActiveChatIfMatching(targetBook, _loadedSummaries, {
+        greetingIndex: _greetingIndex,
+    });
+
     renderModalContents();
 }
 
-/**
- * Select or deselect all currently visible (filtered) entries in batch mode.
- */
 function toggleSelectAllVisibleEntries() {
     const settings = getSettings();
     const matchedSet = matchEntries(_loadedSummaries, _searchQuery, {
@@ -998,9 +990,6 @@ function toggleSelectAllVisibleEntries() {
     renderBodyAndFooterOnly();
 }
 
-/**
- * Open the `···` menu for a group section.
- */
 function openGroupActionsMenu(anchorEl, groupId) {
     if (!_currentBook) return;
     const settings = getSettings();
@@ -1043,10 +1032,25 @@ function openGroupActionsMenu(anchorEl, groupId) {
         .filter((e) => bookCfg.assignments[e.uid] === groupId)
         .map((e) => e.uid);
 
+    const { saveCtx } = getActiveChatBoundProfile(_currentBook);
+    const isCurrentChatBook = Boolean(saveCtx && saveCtx.primaryWorldName === _currentBook);
+
     const nextQuickMode = grp.mode === GROUP_MODES.IF_LINE ? GROUP_MODES.NORMAL : GROUP_MODES.IF_LINE;
     const quickModeLabel = grp.mode === GROUP_MODES.IF_LINE ? '取消 IF 线互斥（改为普通组）' : '设为 IF 线互斥组';
 
     openFloatingMenu(anchorEl, [
+        ...(isCurrentChatBook ? [{
+            label: '开启并锁为当前聊天存档路线',
+            icon: 'fa-bookmark',
+            disabled: groupUids.length === 0,
+            onClick: () => {
+                if (grp.mode === GROUP_MODES.NORMAL) {
+                    grp.mode = GROUP_MODES.IF_LINE;
+                    saveBookConfigWithCleanEmpty(settings, _currentBook, bookCfg);
+                }
+                void handleGroupToggle(groupId, true, { forceBindChat: true });
+            },
+        }] : []),
         {
             label: '编辑分组名称与模式',
             icon: 'fa-pen',
@@ -1134,9 +1138,6 @@ function openGroupActionsMenu(anchorEl, groupId) {
     ]);
 }
 
-/**
- * Open the `···` menu for a single entry row.
- */
 function openEntryActionsMenu(anchorEl, uid) {
     if (!_currentBook) return;
     const entry = _loadedSummaries.find((e) => e.uid === uid);
@@ -1190,9 +1191,6 @@ function openEntryActionsMenu(anchorEl, uid) {
     ]);
 }
 
-/**
- * Render the entire modal (book selector, header stats, body list, footer, and active submodal).
- */
 function renderModalContents() {
     if (!_isOpen || typeof document === 'undefined') return;
     const backdrop = document.getElementById(MODAL_BACKDROP_ID);
@@ -1203,7 +1201,6 @@ function renderModalContents() {
         applyModalThemeAttributes(modal);
     }
 
-    // Sync worldbook selector options without disturbing focus
     const bookSelect = backdrop.querySelector('#weg-book-select');
     if (bookSelect instanceof HTMLSelectElement) {
         const names = getWorldNames();
@@ -1223,8 +1220,57 @@ function renderModalContents() {
 }
 
 /**
- * Render header summary stats, scrollable group/entry list, and constant footer bar.
- * Preserves scroll position of `#weg-body` so toggling an entry or collapsing a group never jumps!
+ * Render the constant-height per-chat save binding bar (`#weg-save-bar`).
+ */
+function renderSaveBindingBar(saveBarEl) {
+    if (!(saveBarEl instanceof HTMLElement)) return;
+
+    const { saveCtx, profile } = getActiveChatBoundProfile(_currentBook);
+    if (!saveCtx) {
+        saveBarEl.innerHTML = `
+            <span class="weg-save-bar-text is-muted">当前未进入聊天存档（进入角色对话后可按存档独立记忆 IF 线）</span>
+        `;
+        return;
+    }
+
+    if (saveCtx.primaryWorldName !== _currentBook) {
+        const hint = saveCtx.primaryWorldName
+            ? `当前聊天角色主书为「${saveCtx.primaryWorldName}」，切回该书可按存档锁线`
+            : '当前聊天角色尚未绑定主世界书';
+        saveBarEl.innerHTML = `<span class="weg-save-bar-text is-muted">${esc(hint)}</span>`;
+        return;
+    }
+
+    const shortChatId = saveCtx.chatId.length > 22 ? `${saveCtx.chatId.slice(0, 22)}…` : saveCtx.chatId;
+
+    if (profile) {
+        saveBarEl.innerHTML = `
+            <div class="weg-save-bar-info" title="聊天存档：${esc(saveCtx.chatId)}（共 ${saveCtx.floorCount} 层）">
+                <i class="fa-solid fa-bookmark weg-save-icon is-bound" aria-hidden="true"></i>
+                <span class="weg-save-bar-text">本档路线：<strong>${esc(profile.routeLabel)}</strong> <span class="weg-save-chatid">(${esc(shortChatId)})</span></span>
+            </div>
+            <div class="weg-save-bar-actions">
+                <button type="button" class="weg-mini-btn" data-weg-save-action="bind-current" title="将当前世界书开关状态更新为本存档的记忆状态">更新锁档</button>
+                <button type="button" class="weg-mini-btn" data-weg-save-action="auto-recognize-chat" title="从当前聊天楼层内容重新识别所属开场白路线">重认本档</button>
+                <button type="button" class="weg-mini-btn is-muted" data-weg-save-action="unbind-current" title="解除本存档的自动切线绑定">解除</button>
+            </div>
+        `;
+    } else {
+        saveBarEl.innerHTML = `
+            <div class="weg-save-bar-info" title="聊天存档：${esc(saveCtx.chatId)}（共 ${saveCtx.floorCount} 层）">
+                <i class="fa-regular fa-bookmark weg-save-icon" aria-hidden="true"></i>
+                <span class="weg-save-bar-text is-muted">当前存档（${esc(shortChatId)}）暂未锁线，开启任意 IF 线或点右侧即可记住本档</span>
+            </div>
+            <div class="weg-save-bar-actions">
+                <button type="button" class="weg-mini-btn" data-weg-save-action="auto-recognize-chat" ${_loadedSummaries.length === 0 ? 'disabled' : ''}>识别本档</button>
+                <button type="button" class="weg-mini-btn is-primary" data-weg-save-action="bind-current" ${_loadedSummaries.length === 0 ? 'disabled' : ''}>锁定到本档</button>
+            </div>
+        `;
+    }
+}
+
+/**
+ * Render header summary stats, save-binding bar, scrollable group/entry list, and constant footer bar.
  */
 function renderBodyAndFooterOnly() {
     if (!_isOpen || typeof document === 'undefined') return;
@@ -1232,6 +1278,7 @@ function renderBodyAndFooterOnly() {
     if (!backdrop) return;
 
     const statsEl = backdrop.querySelector('#weg-header-stats');
+    const saveBarEl = backdrop.querySelector('#weg-save-bar');
     const bodyEl = backdrop.querySelector('#weg-body');
     const footerEl = backdrop.querySelector('#weg-footer');
     if (!(bodyEl instanceof HTMLElement) || !(footerEl instanceof HTMLElement)) return;
@@ -1241,29 +1288,18 @@ function renderBodyAndFooterOnly() {
     const bookCfg = _currentBook ? getBookConfigMutable(settings, _currentBook) : normalizeBookConfig(null);
     const grouped = buildGroupedView(_loadedSummaries, bookCfg);
 
-    // Header stats badge
+    renderSaveBindingBar(saveBarEl);
+
     if (statsEl instanceof HTMLElement) {
         if (!_currentBook) {
             statsEl.textContent = '';
         } else if (_loadingBook) {
             statsEl.textContent = '正在读取…';
         } else {
-            const parts = [`已开 ${grouped.totalEnabled} / ${grouped.totalEntries} 条`];
-            if (_greetingIndex?.hasManagedEntries) {
-                if (_greetingIndex.activeGreeting) {
-                    const gLabel = _greetingIndex.activeGreeting.title
-                        ? `${_greetingIndex.activeGreeting.label} ${_greetingIndex.activeGreeting.title}`
-                        : `开场白 ${_greetingIndex.activeGreeting.label}`;
-                    parts.push(`联动：${gLabel}`);
-                } else {
-                    parts.push('含开场白联动标签');
-                }
-            }
-            statsEl.textContent = parts.join(' · ');
+            statsEl.textContent = `已开 ${grouped.totalEnabled} / ${grouped.totalEntries} 条`;
         }
     }
 
-    // Main scrollable body
     if (!_currentBook) {
         bodyEl.innerHTML = `
             <div class="weg-empty-state">
@@ -1308,7 +1344,6 @@ function renderBodyAndFooterOnly() {
 
         const sectionsHtml = [];
         for (const sec of grouped.sections) {
-            // Hide empty ungrouped section when all entries are already neatly organized into custom groups
             if (sec.isUngrouped && sec.totalCount === 0 && grouped.sections.length > 1) {
                 continue;
             }
@@ -1323,7 +1358,7 @@ function renderBodyAndFooterOnly() {
 
             const effectiveCollapsed = isFiltering ? false : sec.collapsed;
             const modeBadge = sec.mode === GROUP_MODES.IF_LINE
-                ? '<span class="weg-badge weg-badge-if" title="开启本组时，自动关闭本书其他 IF 线互斥组">IF 互斥</span>'
+                ? '<span class="weg-badge weg-badge-if" title="开启本组时，自动关闭本书其他 IF 线互斥组，并记住到当前聊天存档">IF 互斥</span>'
                 : (sec.mode === GROUP_MODES.RADIO
                     ? '<span class="weg-badge weg-badge-radio" title="开启本组任意一条时，自动关闭本组其余条目">组内单选</span>'
                     : '');
@@ -1390,7 +1425,6 @@ function renderBodyAndFooterOnly() {
 
     bodyEl.scrollTop = prevScrollTop;
 
-    // Constant-height bottom action bar
     const undoCount = getUndoCount(_currentBook);
     const allGroupsCollapsed = bookCfg.groups.every((g) => g.collapsed) && bookCfg.ungroupedCollapsed;
 
@@ -1419,14 +1453,10 @@ function renderBodyAndFooterOnly() {
     }
 }
 
-/**
- * Render a single compact one-line entry row (`toggle + ···` on the right).
- */
 function renderEntryRowHtml(entry) {
     const isEnabled = !entry.disabled;
     const isSelected = _selectedUids.has(entry.uid);
 
-    // Strategy indicator dot (constant blue / vectorized link / normal green)
     let dotClass = 'is-normal';
     let dotTitle = '关键词触发条目';
     if (entry.constant) {
@@ -1437,7 +1467,6 @@ function renderEntryRowHtml(entry) {
         dotTitle = '向量触发条目';
     }
 
-    // Subtle greeting coordination badge if controlled by `<!-- lore / exclude -->`
     let greetingBadgeHtml = '';
     const greetMeta = _greetingIndex?.byUid?.get?.(entry.uid);
     if (greetMeta) {
@@ -1448,9 +1477,8 @@ function renderEntryRowHtml(entry) {
             const shortText = incList.length === 1
                 ? (first.title ? `${first.label} ${first.title.slice(0, 8)}` : `开场白 ${first.label}`)
                 : `开场白 ×${incList.length}`;
-            const fullTip = `随开场白注释自动开关（开启于：${incList.map((g) => (g.title ? `${g.label} ${g.title}` : g.label)).join('、')}）`;
-            const isCurrentActive = _greetingIndex.currentSwipeId !== null && incList.some((g) => g.swipeIndex === _greetingIndex.currentSwipeId);
-            greetingBadgeHtml = `<span class="weg-greet-tag${isCurrentActive ? ' is-current' : ''}" title="${esc(fullTip)}">${esc(shortText)}</span>`;
+            const fullTip = `关联开场白注释（开启于：${incList.map((g) => (g.title ? `${g.label} ${g.title}` : g.label)).join('、')}）`;
+            greetingBadgeHtml = `<span class="weg-greet-tag" title="${esc(fullTip)}">${esc(shortText)}</span>`;
         } else if (excList.length > 0) {
             const fullTip = `在开场白 ${excList.map((g) => (g.title ? `${g.label} ${g.title}` : g.label)).join('、')} 中自动排除关闭`;
             greetingBadgeHtml = `<span class="weg-greet-tag is-exclude" title="${esc(fullTip)}">排除联动</span>`;
@@ -1498,7 +1526,7 @@ function renderEntryRowHtml(entry) {
 }
 
 // ============================================================================
-// Submodals (Stacked cleanly inside `.weg-modal`; closing returns to main view)
+// Submodals
 // ============================================================================
 
 function closeSubmodal() {
@@ -1506,10 +1534,6 @@ function closeSubmodal() {
     renderSubmodalHost();
 }
 
-/**
- * Open Create / Edit Group submodal (pre-fills existing name + provides 1-click Clear button).
- * @param {{ id: string, name: string, mode: string } | null} existingGroup
- */
 function openGroupFormSubmodal(existingGroup = null) {
     _submodal = {
         type: 'group-form',
@@ -1520,10 +1544,6 @@ function openGroupFormSubmodal(existingGroup = null) {
     renderSubmodalHost();
 }
 
-/**
- * Open Batch Move Entries submodal (can move into an existing group, ungrouped, or a brand-new group).
- * @param {string[]} uids
- */
 function openBatchMoveSubmodal(uids) {
     _submodal = {
         type: 'batch-move',
@@ -1532,15 +1552,11 @@ function openBatchMoveSubmodal(uids) {
     renderSubmodalHost();
 }
 
-/**
- * Open Auto-Detect Groups preview submodal.
- */
 async function openAutoDetectSubmodal() {
     const settings = getSettings();
     const bookCfg = getBookConfigMutable(settings, _currentBook);
     const hasExistingAssignments = Object.keys(bookCfg.assignments).length > 0;
 
-    // Fetch greeting tags on demand even for shallow cards when opening auto-detect!
     if (!_greetingIndex && _currentBook) {
         const res = await resolveGreetingCoordinationForBook(_currentBook, { allowFetchShallow: true });
         if (res.greetingIndex) {
@@ -1567,17 +1583,11 @@ async function openAutoDetectSubmodal() {
     renderSubmodalHost();
 }
 
-/**
- * Open Appearance & Behavior Settings submodal.
- */
 function openSettingsSubmodal() {
     _submodal = { type: 'settings' };
     renderSubmodalHost();
 }
 
-/**
- * Render the active submodal inside `#weg-submodal-host` without resizing the outer `.weg-modal`.
- */
 function renderSubmodalHost() {
     if (typeof document === 'undefined') return;
     const host = document.querySelector(`#${MODAL_BACKDROP_ID} #weg-submodal-host`);
@@ -1602,14 +1612,14 @@ function renderSubmodalHost() {
                 <div class="weg-submodal-body">
                     <label class="weg-field-label" for="weg-group-name-input">分组名称</label>
                     <div class="weg-input-with-clear">
-                        <input type="text" class="weg-input" id="weg-group-name-input" value="${esc(_submodal.initialName)}" placeholder="例如：基础世界观 / IF·青梅线" maxlength="40" autocomplete="off" />
+                        <input type="text" class="weg-input" id="weg-group-name-input" value="${esc(_submodal.initialName)}" placeholder="例如：18岁 IF线 / 30岁 IF线" maxlength="40" autocomplete="off" />
                         <button type="button" class="weg-clear-input-btn" id="weg-group-name-clear">清空</button>
                     </div>
 
                     <div class="weg-field-label" style="margin-top: 12px;">开关联动模式</div>
                     <div class="weg-mode-options" id="weg-group-mode-list">
                         ${renderModeOptionHtml(GROUP_MODES.NORMAL, _submodal.mode, '普通组', '整组一键全开或全关，与其他分组互不影响')}
-                        ${renderModeOptionHtml(GROUP_MODES.IF_LINE, _submodal.mode, 'IF 线互斥组', '开启本组时，自动关闭本书其他标为「IF 线互斥」的分组')}
+                        ${renderModeOptionHtml(GROUP_MODES.IF_LINE, _submodal.mode, 'IF 线互斥组', '开启本组时自动关闭其他 IF 线分组，并记住到当前聊天存档')}
                         ${renderModeOptionHtml(GROUP_MODES.RADIO, _submodal.mode, '组内单选组', '开启本组内任意一条时，自动关闭本组其余条目')}
                     </div>
                 </div>
@@ -1709,7 +1719,7 @@ function renderSubmodalHost() {
                     <div class="weg-detect-controls">
                         <select class="weg-select" id="weg-detect-strategy" aria-label="识别规则">
                             <option value="smart" ${_submodal.strategy === 'smart' ? 'selected' : ''}>智能综合识别（推荐）</option>
-                            <option value="prefix" ${_submodal.strategy === 'prefix' ? 'selected' : ''}>仅按标题前缀（如【世界观】/ IF1-）</option>
+                            <option value="prefix" ${_submodal.strategy === 'prefix' ? 'selected' : ''}>仅按标题前缀（如【世界观】/ 18岁线-）</option>
                             <option value="divider" ${_submodal.strategy === 'divider' ? 'selected' : ''}>仅按分隔条区间（如 === 设定 ===）</option>
                             <option value="greeting" ${_submodal.strategy === 'greeting' ? 'selected' : ''}>仅按角色开场白联动注释</option>
                         </select>
@@ -1740,6 +1750,16 @@ function renderSubmodalHost() {
                     <button type="button" class="weg-icon-btn" data-weg-sub-close="1" aria-label="返回"><i class="fa-solid fa-xmark"></i></button>
                 </div>
                 <div class="weg-submodal-body weg-settings-list">
+                    <div class="weg-setting-row">
+                        <div class="weg-setting-text">
+                            <div class="weg-setting-name">切换聊天存档时自动认档切线</div>
+                            <div class="weg-setting-desc">按每个存档记住的 IF 线或楼层开场白自动恢复世界书开关</div>
+                        </div>
+                        <button type="button" class="weg-switch${settings.autoSwitchOnChatChange !== false ? ' is-on' : ''}" id="weg-set-auto-chat-switch" role="switch" aria-checked="${settings.autoSwitchOnChatChange !== false}">
+                            <span class="weg-switch-thumb"></span>
+                        </button>
+                    </div>
+
                     <div class="weg-setting-row">
                         <div class="weg-setting-text">
                             <div class="weg-setting-name">弹窗配色方案</div>
@@ -1788,8 +1808,8 @@ function renderSubmodalHost() {
 
                     <div class="weg-setting-row">
                         <div class="weg-setting-text">
-                            <div class="weg-setting-name">感知角色开场白联动标签</div>
-                            <div class="weg-setting-desc">自动标记受开场白控制的条目，并在切开场白后同步开关显示</div>
+                            <div class="weg-setting-name">显示角色开场白联动标记</div>
+                            <div class="weg-setting-desc">在条目旁展示其绑定的开场白编号与标题</div>
                         </div>
                         <button type="button" class="weg-switch${settings.syncGreetingTags !== false ? ' is-on' : ''}" id="weg-set-sync-greeting" role="switch" aria-checked="${settings.syncGreetingTags !== false}">
                             <span class="weg-switch-thumb"></span>
@@ -2086,6 +2106,7 @@ function wireSettingsSubmodal(host) {
     wireCommonSubmodalClose(host);
     const settings = getSettings();
 
+    const autoChatSwitch = host.querySelector('#weg-set-auto-chat-switch');
     const paletteSel = host.querySelector('#weg-set-palette');
     const modeSel = host.querySelector('#weg-set-colormode');
     const nativeBtnSwitch = host.querySelector('#weg-set-native-btn');
@@ -2120,6 +2141,7 @@ function wireSettingsSubmodal(host) {
         });
     };
 
+    bindSwitch(autoChatSwitch, 'autoSwitchOnChatChange');
     bindSwitch(nativeBtnSwitch, 'showNativeEntryBtn');
     bindSwitch(closeLocateSwitch, 'closeOnLocate');
     bindSwitch(syncGreetingSwitch, 'syncGreetingTags', () => {
