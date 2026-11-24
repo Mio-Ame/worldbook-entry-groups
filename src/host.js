@@ -19,8 +19,10 @@ import {
     buildGreetingCoordinationIndex,
     buildInitialProfileFromFloorZero,
     computeChatProfileRestorePlan,
+    computeGreetingPresetPlan,
     computeGroupTogglePlan,
     evaluateSceneAutoToggle,
+    extractExternalScriptRouteLabel,
     extractWorldbookEntrySummaries,
     normalizeBookConfig,
     normalizeChatProfile,
@@ -785,15 +787,77 @@ export function recordStateIntoActiveChatIfMatching(worldName, summaries, opts =
     const settings = getSettings();
     if (!opts.force && settings.autoSwitchOnChatChange === false) return null;
 
+    const ctx = getHostContext();
     const saveCtx = getCurrentChatSaveContext();
     if (!saveCtx || saveCtx.primaryWorldName !== cleanWorld) return null;
 
     const bookConfig = normalizeBookConfig(settings.books?.[cleanWorld]);
-    const profile = buildChatProfileFromCurrentState(cleanWorld, summaries, bookConfig, opts);
+    const externalRouteHint = extractExternalScriptRouteLabel(ctx?.chatMetadata);
+    const profile = buildChatProfileFromCurrentState(cleanWorld, summaries, bookConfig, {
+        ...opts,
+        externalRouteHint,
+    });
     if (!profile) return null;
 
     saveActiveChatBoundProfile(profile);
     return profile;
+}
+
+/**
+ * Automatically follow & snapshot worldbook switches made by any author's Tavern Helper script
+ * (e.g. `setLorebookEntries` triggered by custom route buttons or opening managers) into the
+ * active chat save's `chatMetadata` so switching saves later restores all layers seamlessly!
+ */
+export async function captureExternalWorldbookSwitchForActiveChat(worldName = '') {
+    const settings = getSettings();
+    if (settings.autoSwitchOnChatChange === false || isWithinSelfWriteWindow()) return null;
+
+    const saveCtx = getCurrentChatSaveContext();
+    if (!saveCtx || !saveCtx.primaryWorldName) return null;
+    if (worldName && String(worldName).trim() !== saveCtx.primaryWorldName) return null;
+
+    const readRes = await loadWorldbookSummariesUncached(saveCtx.primaryWorldName);
+    if (!readRes.ok || readRes.summaries.length === 0) return null;
+
+    return recordStateIntoActiveChatIfMatching(saveCtx.primaryWorldName, readRes.summaries);
+}
+
+/**
+ * Apply a character card's greeting preset (`<!-- lore / exclude -->`) in 1 single disk write
+ * and lock the resulting multi-group entry combination onto the active chat save!
+ */
+export async function applyGreetingPresetToWorldbook(worldName, greetingIndex, swipeIndex) {
+    const cleanWorld = String(worldName ?? '').trim();
+    if (!cleanWorld || !greetingIndex) {
+        return { ok: false, error: '缺少开场白联动方案数据' };
+    }
+
+    const readRes = await loadWorldbookSummariesUncached(cleanWorld);
+    if (!readRes.ok) {
+        return { ok: false, error: readRes.error };
+    }
+
+    const preset = computeGreetingPresetPlan(readRes.summaries, greetingIndex, swipeIndex);
+    if (!preset) {
+        return { ok: false, error: '该开场白未配置世界书联动标签' };
+    }
+
+    const writeRes = await applyWorldbookTogglePlan(cleanWorld, preset.plan);
+    if (!writeRes.ok) {
+        return { ok: false, error: writeRes.error };
+    }
+
+    recordStateIntoActiveChatIfMatching(cleanWorld, writeRes.summaries, {
+        customLabel: preset.routeLabel,
+        force: true,
+    });
+
+    return {
+        ok: true,
+        changedCount: writeRes.changedCount,
+        routeLabel: preset.routeLabel,
+        summaries: writeRes.summaries,
+    };
 }
 
 export async function locateEntryInNativeEditor(worldName, uid, entryTitle = '') {

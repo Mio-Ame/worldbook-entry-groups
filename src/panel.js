@@ -23,6 +23,7 @@ import {
     pruneOrphanAssignments,
 } from './core.js';
 import {
+    applyGreetingPresetToWorldbook,
     applyTauriSurface,
     applyWorldbookTogglePlan,
     copyTextToClipboard,
@@ -39,7 +40,7 @@ import {
     showToast,
 } from './host.js';
 
-const APP_VERSION = '0.3.0';
+const APP_VERSION = '0.4.0';
 const NATIVE_BTN_ID = 'weg-native-entry-btn';
 const WAND_ENTRY_ID = 'weg-wand-entry';
 const EXT_DRAWER_ID = 'weg-extension-settings';
@@ -753,7 +754,30 @@ function wireShellEvents(modal) {
         renderBodyAndFooterOnly();
     });
 
-    // Pure metadata per-chat save bar actions (zero chat history scan!)
+    // Pure metadata per-chat save bar actions + 1-click greeting preset selector
+    saveBarEl?.addEventListener('change', async (ev) => {
+        const sel = ev.target instanceof HTMLSelectElement ? ev.target : null;
+        if (!sel || sel.id !== 'weg-preset-greeting-select' || sel.value === '') return;
+        const swipeIdx = Number.parseInt(sel.value, 10);
+        sel.value = '';
+        if (!Number.isInteger(swipeIdx) || !_currentBook || !_greetingIndex || _writingToggle) return;
+
+        _writingToggle = true;
+        renderBodyAndFooterOnly();
+        const res = await applyGreetingPresetToWorldbook(_currentBook, _greetingIndex, swipeIdx);
+        _writingToggle = false;
+
+        if (!res.ok) {
+            showToast('error', res.error || '套用开场白方案失败');
+            renderBodyAndFooterOnly();
+            return;
+        }
+        _loadedSummaries = res.summaries;
+        syncAllNativeEntryPoints();
+        renderModalContents();
+        showToast('success', `已套用方案「${res.routeLabel}」并记住到本存档`);
+    });
+
     saveBarEl?.addEventListener('click', (ev) => {
         const target = ev.target instanceof Element ? ev.target : null;
         if (!target) return;
@@ -1321,10 +1345,19 @@ function renderModalContents() {
 function renderSaveBindingBar(saveBarEl) {
     if (!(saveBarEl instanceof HTMLElement)) return;
 
+    const presetGreets = _greetingIndex?.presetGreetings || [];
+    const presetSelectHtml = presetGreets.length > 0 ? `
+        <select class="weg-mini-select" id="weg-preset-greeting-select" aria-label="套用开场白联动方案" ${_writingToggle ? 'disabled' : ''}>
+            <option value="">套用开场方案 (${presetGreets.length})…</option>
+            ${presetGreets.map((g) => `<option value="${g.swipeIndex}">${esc(g.title ? `${g.label} ${g.title}` : `开场白 ${g.label}`)}（${g.loreUids.length}条）</option>`).join('')}
+        </select>
+    ` : '';
+
     const { saveCtx, profile } = getActiveChatBoundProfile(_currentBook);
     if (!saveCtx) {
         saveBarEl.innerHTML = `
-            <span class="weg-save-bar-text is-muted">当前未进入聊天存档（进入对话后，开启任意 IF 线即可记住本档阶段）</span>
+            <span class="weg-save-bar-text is-muted">当前未进入聊天存档（进入对话后，切换路线或脚本改书会自动记住本档阶段）</span>
+            <div class="weg-save-bar-actions">${presetSelectHtml}</div>
         `;
         return;
     }
@@ -1333,19 +1366,23 @@ function renderSaveBindingBar(saveBarEl) {
         const hint = saveCtx.primaryWorldName
             ? `当前聊天角色主书为「${saveCtx.primaryWorldName}」，切回该书可管理本档路线`
             : '当前聊天角色尚未绑定主世界书';
-        saveBarEl.innerHTML = `<span class="weg-save-bar-text is-muted">${esc(hint)}</span>`;
+        saveBarEl.innerHTML = `
+            <span class="weg-save-bar-text is-muted">${esc(hint)}</span>
+            <div class="weg-save-bar-actions">${presetSelectHtml}</div>
+        `;
         return;
     }
 
-    const shortChatId = saveCtx.chatId.length > 22 ? `${saveCtx.chatId.slice(0, 22)}…` : saveCtx.chatId;
+    const shortChatId = saveCtx.chatId.length > 20 ? `${saveCtx.chatId.slice(0, 20)}…` : saveCtx.chatId;
 
     if (profile) {
         saveBarEl.innerHTML = `
-            <div class="weg-save-bar-info" title="仅存储于当前存档元数据，不扫描聊天记录；剧情推进（如 18岁→30岁）时直接打开新阶段分组即可覆盖更新">
+            <div class="weg-save-bar-info" title="仅存储于当前存档元数据，不扫描聊天记录；本档用面板或角色卡脚本切线都会自动同步更新">
                 <i class="fa-solid fa-bookmark weg-save-icon is-bound" aria-hidden="true"></i>
                 <span class="weg-save-bar-text">本档当前阶段：<strong>${esc(profile.routeLabel)}</strong> <span class="weg-save-chatid">(${esc(shortChatId)})</span></span>
             </div>
             <div class="weg-save-bar-actions">
+                ${presetSelectHtml}
                 <button type="button" class="weg-mini-btn" data-weg-save-action="bind-current" title="将当前开关组合更新为本档记忆">更新本档</button>
                 <button type="button" class="weg-mini-btn is-muted" data-weg-save-action="unbind-current" title="解除本存档绑定">解除</button>
             </div>
@@ -1354,10 +1391,11 @@ function renderSaveBindingBar(saveBarEl) {
         saveBarEl.innerHTML = `
             <div class="weg-save-bar-info" title="聊天存档：${esc(saveCtx.chatId)}">
                 <i class="fa-regular fa-bookmark weg-save-icon" aria-hidden="true"></i>
-                <span class="weg-save-bar-text is-muted">当前存档（${esc(shortChatId)}）暂未锁线，直接打开目标 IF 线或点右侧即可记住</span>
+                <span class="weg-save-bar-text is-muted">当前存档（${esc(shortChatId)}）暂未锁线，切换路线、套用方案或点右侧即可记住</span>
             </div>
             <div class="weg-save-bar-actions">
-                <button type="button" class="weg-mini-btn is-primary" data-weg-save-action="bind-current" ${_loadedSummaries.length === 0 ? 'disabled' : ''}>锁定当前状态到本档</button>
+                ${presetSelectHtml}
+                <button type="button" class="weg-mini-btn is-primary" data-weg-save-action="bind-current" ${_loadedSummaries.length === 0 ? 'disabled' : ''}>锁定本档</button>
             </div>
         `;
     }

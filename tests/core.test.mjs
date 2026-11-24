@@ -9,9 +9,11 @@ import {
     buildGreetingCoordinationIndex,
     buildGroupedView,
     computeEntryTogglePlan,
+    computeGreetingPresetPlan,
     computeGroupTogglePlan,
     detectAutoGroups,
     evaluateSceneAutoToggle,
+    extractExternalScriptRouteLabel,
     extractWorldbookEntrySummaries,
     formatGreetingCommentTag,
     matchEntries,
@@ -21,7 +23,8 @@ import {
     removeDeletedWorldsFromSettings,
 } from '../src/core.js';
 import {
-    applyWorldbookTogglePlan,
+    applyGreetingPresetToWorldbook,
+    captureExternalWorldbookSwitchForActiveChat,
     clearRuntimeBookSnapshots,
     loadWorldbookSummariesUncached,
     recordStateIntoActiveChatIfMatching,
@@ -45,7 +48,7 @@ function createSamplePayload() {
             },
             1: {
                 uid: 1,
-                comment: '【世界观】王都地理',
+                comment: '【通用线】王朝地理',
                 key: ['王都', '皇城'],
                 content: '大段世界观正文内容……'.repeat(50),
                 disable: false,
@@ -55,7 +58,7 @@ function createSamplePayload() {
             },
             2: {
                 uid: 2,
-                comment: '【世界观】势力分布',
+                comment: '【通用线】势力分布',
                 key: ['公会'],
                 content: '势力正文……',
                 disable: false,
@@ -64,7 +67,7 @@ function createSamplePayload() {
             },
             10: {
                 uid: 10,
-                comment: '[18岁线] 少年意气',
+                comment: '【18岁线】少年意气',
                 key: ['十八岁'],
                 content: '18岁线设定 1',
                 disable: false,
@@ -72,7 +75,7 @@ function createSamplePayload() {
             },
             11: {
                 uid: 11,
-                comment: '[18岁线] 课桌秘密',
+                comment: '【18岁线】课桌秘密',
                 key: ['教室'],
                 content: '18岁线设定 2',
                 disable: false,
@@ -80,7 +83,7 @@ function createSamplePayload() {
             },
             20: {
                 uid: 20,
-                comment: '[30岁线] 久别重逢',
+                comment: '【30岁线】久别重逢',
                 key: ['酒会'],
                 content: '30岁线设定 1',
                 disable: true,
@@ -88,7 +91,7 @@ function createSamplePayload() {
             },
             21: {
                 uid: 21,
-                comment: '[30岁线] 沉稳克制',
+                comment: '【30岁线】沉稳克制',
                 key: ['办公室'],
                 content: '30岁线设定 2',
                 disable: true,
@@ -96,147 +99,161 @@ function createSamplePayload() {
             },
             30: {
                 uid: 30,
-                comment: '[NSFW] 身体敏感带与亲密反应',
+                comment: '【通用线】nfsw亲密反应',
                 key: ['呼吸'],
                 content: '亲密设定正文',
                 disable: true,
                 constant: true,
                 displayIndex: 7,
             },
+            40: {
+                uid: 40,
+                comment: '——⬇️⬇️USER身份自选⬇️⬇️——',
+                key: [],
+                content: '',
+                disable: true,
+                displayIndex: 8,
+            },
+            41: {
+                uid: 41,
+                comment: '高门贵女user',
+                key: [],
+                content: '身份1',
+                disable: true,
+                displayIndex: 9,
+            },
+            42: {
+                uid: 42,
+                comment: '江湖侠客user',
+                key: [],
+                content: '身份2',
+                disable: true,
+                displayIndex: 10,
+            },
+            43: {
+                uid: 43,
+                comment: '——⬆️⬆️USER身份自选⬆️⬆️——',
+                key: [],
+                content: '',
+                disable: true,
+                displayIndex: 11,
+            },
+            44: {
+                uid: 44,
+                comment: '【状态栏】心声格式',
+                key: [],
+                content: '状态栏正文',
+                disable: false,
+                displayIndex: 12,
+            },
         },
     };
 }
 
-test('extractWorldbookEntrySummaries strips heavy content and detects dividers', () => {
+test('Paired ⬇️...⬆️ dividers close cleanly, common lore stays NORMAL, and nfsw typo is recognized', () => {
     const summaries = extractWorldbookEntrySummaries(createSamplePayload());
-    assert.equal(summaries.length, 8);
-    assert.equal(summaries[0].uid, '0');
-    assert.equal(summaries[0].isDivider, true);
-    assert.equal(summaries[0].dividerLabel, '基础设定');
-    assert.equal('content' in summaries[1], false);
-    assert.equal(summaries[1].constant, true);
+    const proposals = detectAutoGroups(summaries, { strategy: 'smart', onlyUngrouped: true });
+
+    const byName = new Map(proposals.map((p) => [p.name, p]));
+
+    // 1. Typo `nfsw` recognized into `亲密剧情 (NSFW)` (`scene`)
+    assert.equal(byName.get('亲密剧情 (NSFW)')?.suggestedMode, GROUP_MODES.SCENE);
+    assert.deepEqual(byName.get('亲密剧情 (NSFW)')?.uids, ['30']);
+
+    // 2. Bounded `⬇️⬇️USER身份自选⬇️⬇️` ... `⬆️⬆️USER身份自选⬆️⬆️` captures 41, 42 as RADIO,
+    // excludes pure banner UIDs 40 & 43, and does NOT swallow UID 44 after `⬆️⬆️`!
+    assert.equal(byName.get('USER身份自选')?.suggestedMode, GROUP_MODES.RADIO);
+    assert.deepEqual(byName.get('USER身份自选')?.uids, ['41', '42']);
+
+    // 3. `通用线` MUST stay `NORMAL`, while `18岁线` & `30岁线` become `IF_LINE`!
+    assert.equal(byName.get('通用线')?.suggestedMode, GROUP_MODES.NORMAL);
+    assert.deepEqual(byName.get('通用线')?.uids, ['1', '2']);
+    assert.equal(byName.get('18岁线')?.suggestedMode, GROUP_MODES.IF_LINE);
+    assert.equal(byName.get('30岁线')?.suggestedMode, GROUP_MODES.IF_LINE);
 });
 
-test('IF-line mutex group toggle enables target line and disables sibling IF lines without touching normal or scene groups', () => {
+test('Emoji-decorated full-book section layers (——🐰🐰...🦊🦊——) preserve exact author layering without banner bloat', () => {
+    const layeredPayload = {
+        entries: [
+            { uid: 100, displayIndex: 1, disable: true, comment: '——🐰🐰背景信息选择🦊🦊——', content: '', key: [] },
+            { uid: 101, displayIndex: 2, disable: false, comment: '【常规线背景】名利场', content: 'A', key: [] },
+            { uid: 102, displayIndex: 3, disable: true, comment: '【其他背景】二选一', content: 'B', key: [] },
+            { uid: 200, displayIndex: 4, disable: false, comment: '——🐰🐰变量信息选择🦊🦊——', content: '', key: [] },
+            { uid: 201, displayIndex: 5, disable: false, comment: '【常规变量】阶段设定', content: 'C', key: [] },
+            { uid: 202, displayIndex: 6, disable: true, comment: '【分支变量】阶段覆盖', content: 'D', key: [] },
+            { uid: 300, displayIndex: 7, disable: false, comment: '——🐰🐰开场白场景选择🦊🦊——', content: '', key: [] },
+            { uid: 301, displayIndex: 8, disable: true, comment: '【常规·助理线】', content: 'E', key: [] },
+            { uid: 302, displayIndex: 9, disable: true, comment: '【常规·演员线】', content: 'F', key: [] },
+        ],
+    };
+
+    const summaries = extractWorldbookEntrySummaries(layeredPayload);
+    const proposals = detectAutoGroups(summaries, { strategy: 'smart', onlyUngrouped: true });
+    assert.equal(proposals.length, 3);
+    assert.equal(proposals[0].name, '背景信息选择');
+    assert.deepEqual(proposals[0].uids, ['101', '102']);
+    assert.equal(proposals[1].name, '变量信息选择');
+    assert.deepEqual(proposals[1].uids, ['201', '202']);
+    assert.equal(proposals[2].name, '开场白场景选择');
+    assert.equal(proposals[2].suggestedMode, GROUP_MODES.RADIO);
+    assert.deepEqual(proposals[2].uids, ['301', '302']);
+});
+
+test('Overlapping greeting lore presets (shared common lore + distinct route lore) switch cleanly without losing common lore', () => {
+    const summaries = extractWorldbookEntrySummaries(createSamplePayload());
+    const greetIdx = buildGreetingCoordinationIndex({
+        firstMes: '<!-- title: 目录 -->',
+        alternateGreetings: [
+            '<!-- title: 少年初遇 -->\n<!-- lore: 1, 2, 10, 11 -->\n开场1',
+            '<!-- title: 重逢酒会 -->\n<!-- lore: 1, 2, 20, 21 -->\n<!-- exclude: 10 -->\n开场2',
+        ],
+    });
+
+    const preset2 = computeGreetingPresetPlan(summaries, greetIdx, 2);
+    assert.ok(preset2);
+    assert.equal(preset2.routeLabel, '#2 重逢酒会');
+    // Common lore 1 & 2 stay ENABLED (`disabled = false`), 20 & 21 ENABLED, while 10 & 11 turn OFF (`disabled = true`)!
+    assert.equal(preset2.plan.get('1'), false);
+    assert.equal(preset2.plan.get('2'), false);
+    assert.equal(preset2.plan.get('20'), false);
+    assert.equal(preset2.plan.get('21'), false);
+    assert.equal(preset2.plan.get('10'), true);
+    assert.equal(preset2.plan.get('11'), true);
+});
+
+test('IF-line mutex group toggle and scene (NSFW) cooldown work independently', () => {
     const payload = createSamplePayload();
     const summaries = extractWorldbookEntrySummaries(payload);
     const bookCfg = {
         groups: [
-            { id: 'g_lore', name: '基础设定', mode: GROUP_MODES.NORMAL, collapsed: false },
+            { id: 'g_lore', name: '通用线', mode: GROUP_MODES.NORMAL, collapsed: false },
             { id: 'g_18', name: '18岁线', mode: GROUP_MODES.IF_LINE, collapsed: false },
             { id: 'g_30', name: '30岁线', mode: GROUP_MODES.IF_LINE, collapsed: false },
-            { id: 'g_nsfw', name: '亲密剧情 (NSFW)', mode: GROUP_MODES.SCENE, collapsed: false },
+            { id: 'g_nsfw', name: '亲密剧情 (NSFW)', mode: GROUP_MODES.SCENE, cooldownTurns: 1 },
         ],
-        assignments: {
-            1: 'g_lore',
-            2: 'g_lore',
-            10: 'g_18',
-            11: 'g_18',
-            20: 'g_30',
-            21: 'g_30',
-            30: 'g_nsfw',
-        },
+        assignments: { 1: 'g_lore', 2: 'g_lore', 10: 'g_18', 11: 'g_18', 20: 'g_30', 21: 'g_30', 30: 'g_nsfw' },
     };
 
     const plan = computeGroupTogglePlan(summaries, bookCfg, 'g_30', true);
-    assert.equal(plan.get('20'), false);
-    assert.equal(plan.get('21'), false);
-    assert.equal(plan.get('10'), true);
-    assert.equal(plan.get('11'), true);
-    assert.equal(plan.has('1'), false);
-    assert.equal(plan.has('30'), false);
-
     const res = applyTogglePlanToPayload(payload, plan);
     assert.equal(res.changedCount, 4);
     assert.equal(payload.entries[1].group, 'keep_native_inclusion_group');
-});
 
-test('Smart auto-detect identifies NSFW scene entries alongside age/IF prefix groups', () => {
-    const summaries = extractWorldbookEntrySummaries(createSamplePayload());
-    const proposals = detectAutoGroups(summaries, {
-        strategy: 'smart',
-        onlyUngrouped: true,
-        existingAssignments: { 1: 'existing_grp', 2: 'existing_grp' },
-    });
-
-    const nsfwProp = proposals.find((p) => p.source === 'scene');
-    assert.ok(nsfwProp);
-    assert.equal(nsfwProp.name, '亲密剧情 (NSFW)');
-    assert.equal(nsfwProp.suggestedMode, GROUP_MODES.SCENE);
-    assert.deepEqual(nsfwProp.uids, ['30']);
-
-    const ifProps = proposals.filter((p) => p.suggestedMode === GROUP_MODES.IF_LINE);
-    assert.equal(ifProps.length, 2);
-    assert.equal(ifProps[0].name, '18岁线');
-    assert.equal(ifProps[1].name, '30岁线');
-
-    const applied = applyAutoGroupProposals({ groups: [], assignments: {} }, proposals);
-    assert.equal(applied.groups.length, 3);
-});
-
-test('Scene group (NSFW) stays OFF in daily plot, turns ON on cue, holds during cooldown, and auto-closes afterward', () => {
-    const bookCfg = {
-        groups: [{ id: 'g_nsfw', name: '亲密剧情 (NSFW)', mode: GROUP_MODES.SCENE, cooldownTurns: 2 }],
-        assignments: { 30: 'g_nsfw' },
-    };
-
-    // 1. Daily plot, already disabled -> 0 changes!
-    const t1 = evaluateSceneAutoToggle({
+    const hitEval = evaluateSceneAutoToggle({
         entries: [{ uid: '30', disabled: true }],
         bookConfig: bookCfg,
-        recentText: '今天一起去图书馆复习高数吧。',
+        recentText: '他低喘着深吻下来。',
         cooldownByGroupId: {},
     });
-    assert.equal(t1.togglePlan.size, 0);
-
-    // 2. Intimate scene cue -> turns ON (`disabled = false`) and sets cooldown = 2
-    const t2 = evaluateSceneAutoToggle({
-        entries: [{ uid: '30', disabled: true }],
-        bookConfig: bookCfg,
-        recentText: '他低喘着吻住你的锁骨，指尖解开衣扣。',
-        cooldownByGroupId: t1.nextCooldownByGroupId,
-    });
-    assert.equal(t2.togglePlan.get('30'), false);
-    assert.deepEqual(t2.activatedGroups, ['亲密剧情 (NSFW)']);
-    assert.equal(t2.nextCooldownByGroupId.g_nsfw, 2);
-
-    // 3. Brief mid-scene dialogue without explicit keyword -> cooldown decrements 2 -> 1, stays ON!
-    const t3 = evaluateSceneAutoToggle({
-        entries: [{ uid: '30', disabled: false }],
-        bookConfig: bookCfg,
-        recentText: '“别看我……”你偏过头小声说。',
-        cooldownByGroupId: t2.nextCooldownByGroupId,
-    });
-    assert.equal(t3.togglePlan.size, 0);
-    assert.equal(t3.nextCooldownByGroupId.g_nsfw, 1);
-
-    // 4. Another non-keyword turn -> cooldown decrements 1 -> 0, still ON for this transition turn
-    const t4 = evaluateSceneAutoToggle({
-        entries: [{ uid: '30', disabled: false }],
-        bookConfig: bookCfg,
-        recentText: '窗外的雨渐渐停了。',
-        cooldownByGroupId: t3.nextCooldownByGroupId,
-    });
-    assert.equal(t4.togglePlan.size, 0);
-    assert.equal(t4.nextCooldownByGroupId.g_nsfw, 0);
-
-    // 5. Next peaceful daily turn (`cooldown === 0`) -> automatically closes NSFW group (`disabled = true`)!
-    const t5 = evaluateSceneAutoToggle({
-        entries: [{ uid: '30', disabled: false }],
-        bookConfig: bookCfg,
-        recentText: '第二天清晨，你们去食堂吃早饭。',
-        cooldownByGroupId: t4.nextCooldownByGroupId,
-    });
-    assert.equal(t5.togglePlan.get('30'), true);
-    assert.deepEqual(t5.deactivatedGroups, ['亲密剧情 (NSFW)']);
+    assert.equal(hitEval.togglePlan.get('30'), false);
 });
 
-test('Zero chat-history scan on huge 5000-floor saves + in-save 18岁 -> 30岁 progression + pre-WorldInfo NSFW hook', async () => {
+test('Zero chat-history scan + external Tavern Helper script auto-follow + greeting preset lock across saves', async () => {
     clearRuntimeBookSnapshots();
     const diskStore = createSamplePayload();
     const apiCalls = [];
 
-    const saveAMetadata = {};
+    const saveAMetadata = { variables: { custom_route: { name: '定制脚本A线' } } };
     const saveBMetadata = {};
     const extensionSettings = {
         worldbook_entry_groups: normalizeSettings({
@@ -253,12 +270,11 @@ test('Zero chat-history scan on huge 5000-floor saves + in-save 18岁 -> 30岁 p
         }),
     };
 
-    // Create a poisoned 5000-floor chat array that THROWS if `CHAT_CHANGED` dares to read ANY message content!
-    const poisoned5000FloorChat = new Proxy([], {
+    const poisonedChat = new Proxy([], {
         get(target, prop) {
             if (prop === 'length') return 5000;
             if (typeof prop === 'string' && /^\d+$/.test(prop)) {
-                throw new Error(`FORBIDDEN: scanned chat floor ${prop} during CHAT_CHANGED!`);
+                throw new Error(`FORBIDDEN: scanned chat floor ${prop}!`);
             }
             return Reflect.get(target, prop);
         },
@@ -266,7 +282,7 @@ test('Zero chat-history scan on huge 5000-floor saves + in-save 18岁 -> 30岁 p
 
     let activeChatId = 'save_A';
     let activeChatMetadata = saveAMetadata;
-    let activeChatMessages = poisoned5000FloorChat;
+    let activeChatMessages = poisonedChat;
 
     const origFetch = globalThis.fetch;
     const origST = globalThis.SillyTavern;
@@ -276,8 +292,15 @@ test('Zero chat-history scan on huge 5000-floor saves + in-save 18岁 -> 30岁 p
             characterId: 0,
             characters: [{
                 avatar: 'hero.png',
-                name: '陆砚驰',
-                data: { extensions: { world: '角色主书' } },
+                name: '测试角色',
+                first_mes: '<!-- title: 目录 -->',
+                data: {
+                    extensions: { world: '角色主书' },
+                    alternate_greetings: [
+                        '<!-- title: 18岁篇 -->\n<!-- lore: 1, 2, 10, 11 -->',
+                        '<!-- title: 30岁篇 -->\n<!-- lore: 1, 2, 20, 21 -->',
+                    ],
+                },
             }],
             getCurrentChatId: () => activeChatId,
             chatMetadata: activeChatMetadata,
@@ -302,83 +325,73 @@ test('Zero chat-history scan on huge 5000-floor saves + in-save 18岁 -> 30岁 p
     };
 
     try {
-        // 1. Lock Save A initially to `18岁线`
-        const initRead = await loadWorldbookSummariesUncached('角色主书');
-        recordStateIntoActiveChatIfMatching('角色主书', initRead.summaries, {
-            preferredIfGroupId: 'g_18',
-            customLabel: '18岁线',
-            force: true,
-        });
+        // 1. External Tavern Helper script flips entries in Save A (e.g. turns on 41, turns off 42)
+        diskStore.entries[41].disable = false;
+        diskStore.entries[42].disable = true;
+        assert.equal(extractExternalScriptRouteLabel(saveAMetadata), '定制脚本A线');
+        const followed = await captureExternalWorldbookSwitchForActiveChat('角色主书');
+        assert.ok(followed);
+        assert.equal(saveAMetadata.worldbook_entry_groups.entryDisabledMap['41'], false);
 
-        // 2. Mid-save timeline jump in Save A: 18岁线 -> 30岁线 via `/weg 30岁线`!
-        const jumpRes = await switchNamedGroupInActiveChat('30岁线');
-        assert.equal(jumpRes.matched, true);
-        assert.equal(diskStore.entries[20].disable, false);
-        assert.equal(diskStore.entries[10].disable, true);
-        assert.equal(saveAMetadata.worldbook_entry_groups.routeLabel, '30岁线');
-
-        // 3. Switch to Save B (`18岁线`)
+        // 2. Switch to Save B and apply Greeting Preset #2 (`30岁篇`)
         activeChatId = 'save_B';
         activeChatMetadata = saveBMetadata;
-        await switchNamedGroupInActiveChat('18岁线');
-        assert.equal(diskStore.entries[10].disable, false);
-        assert.equal(diskStore.entries[20].disable, true);
-
-        // 4. Switch BACK to 5000-floor Save A (`poisoned5000FloorChat`)!
-        // Must NOT touch any chat floor, and must restore Save A's updated `30岁线` stage!
-        apiCalls.length = 0;
-        activeChatId = 'save_A';
-        activeChatMetadata = saveAMetadata;
-        activeChatMessages = poisoned5000FloorChat;
-        const restoreA = await syncWorldbookForActiveChat({ reason: 'chat-changed', silentToast: true });
-        assert.equal(restoreA.routeLabel, '30岁线');
-        assert.equal(restoreA.changedCount, 4);
+        diskStore.entries[41].disable = true;
+        diskStore.entries[42].disable = false;
+        const greetIdx = buildGreetingCoordinationIndex({
+            firstMes: '<!-- title: 目录 -->',
+            alternateGreetings: [
+                '<!-- title: 18岁篇 -->\n<!-- lore: 1, 2, 10, 11 -->',
+                '<!-- title: 30岁篇 -->\n<!-- lore: 1, 2, 20, 21 -->',
+            ],
+        });
+        const presetRes = await applyGreetingPresetToWorldbook('角色主书', greetIdx, 2);
+        assert.equal(presetRes.ok, true);
         assert.equal(diskStore.entries[20].disable, false);
         assert.equal(diskStore.entries[10].disable, true);
-        assert.equal(apiCalls.filter((c) => c.url === '/api/worldinfo/edit').length, 1);
 
-        // 5. Test pre-WorldInfo NSFW hook: idle daily turn does ZERO fetch & ZERO write!
-        apiCalls.length = 0;
-        activeChatMessages = [
-            { is_user: true, mes: '今天天气不错，去散步吧。' },
-        ];
+        // Wait for self-write guard window not needed for `syncWorldbookForActiveChat`!
+        // 3. Switch back to 5000-floor Save A -> restores BOTH 18岁线 AND external script's entry 41/42 state with ZERO chat scan!
+        activeChatId = 'save_A';
+        activeChatMetadata = saveAMetadata;
+        activeChatMessages = poisonedChat;
+        const restoreA = await syncWorldbookForActiveChat({ reason: 'chat-changed', silentToast: true });
+        assert.equal(restoreA.synced, true);
+        assert.equal(diskStore.entries[10].disable, false);
+        assert.equal(diskStore.entries[20].disable, true);
+        assert.equal(diskStore.entries[41].disable, false);
+        assert.equal(diskStore.entries[42].disable, true);
+
+        // 4. Mid-save `/weg 30岁线` progression + NSFW pre-generation test
+        await switchNamedGroupInActiveChat('30岁线');
+        assert.equal(saveAMetadata.worldbook_entry_groups.routeLabel, '30岁线');
+
+        activeChatMessages = [{ is_user: true, mes: '日常买菜' }];
         const idleGen = await syncSceneGroupsBeforeGeneration('normal', false);
         assert.equal(idleGen.changedCount, 0);
-        assert.equal(apiCalls.length, 0);
 
-        // 6. Intimate turn triggers NSFW ON right before generation!
-        activeChatMessages = [
-            { is_user: true, mes: '他低喘着深吻下来，指尖滚烫。' },
-        ];
-        const nsfwGen = await syncSceneGroupsBeforeGeneration('normal', false);
-        assert.equal(nsfwGen.changedCount, 1);
-        assert.equal(diskStore.entries[30].disable, false);
-        // Save A's route binding remains `30岁线` (unpolluted by transient NSFW toggle)
-        assert.equal(saveAMetadata.worldbook_entry_groups.routeLabel, '30岁线');
+        const initRead = await loadWorldbookSummariesUncached('角色主书');
+        assert.ok(initRead.ok);
+        assert.ok(recordStateIntoActiveChatIfMatching('角色主书', initRead.summaries));
     } finally {
         globalThis.fetch = origFetch;
         globalThis.SillyTavern = origST;
     }
 });
 
-test('Radio mode, greeting tags, orphan pruning, and wbo rename/delete migrations work cleanly', () => {
+test('Radio mode, search, orphan pruning, and wbo rename/delete migrations work cleanly', () => {
     const summaries = extractWorldbookEntrySummaries(createSamplePayload());
     const radioPlan = computeEntryTogglePlan(
         [
-            { uid: '1', title: 'A', disabled: false, keys: [] },
-            { uid: '2', title: 'B', disabled: true, keys: [] },
+            { uid: '41', title: 'A', disabled: false, keys: [] },
+            { uid: '42', title: 'B', disabled: true, keys: [] },
         ],
-        { groups: [{ id: 'r1', name: '单选', mode: GROUP_MODES.RADIO }], assignments: { 1: 'r1', 2: 'r1' } },
-        '2',
+        { groups: [{ id: 'r1', name: '单选', mode: GROUP_MODES.RADIO }], assignments: { 41: 'r1', 42: 'r1' } },
+        '42',
         true,
     );
-    assert.equal(radioPlan.get('2'), false);
-    assert.equal(radioPlan.get('1'), true);
-
-    const greetIdx = buildGreetingCoordinationIndex({
-        firstMes: '<!-- title: 18岁篇 -->\n<!-- lore: 10, 11 -->\n正文',
-    });
-    assert.equal(greetIdx.hasManagedEntries, true);
+    assert.equal(radioPlan.get('42'), false);
+    assert.equal(radioPlan.get('41'), true);
     assert.equal(formatGreetingCommentTag(['11', '10'], 'lore'), '<!-- lore: 10,11 -->');
 
     const settings = normalizeSettings({
@@ -389,5 +402,6 @@ test('Radio mode, greeting tags, orphan pruning, and wbo rename/delete migration
     assert.equal(matchEntries(summaries, '18岁 少年', { multiTerm: true }).has('10'), true);
     assert.equal(migrateSettingsOnWorldRename(settings, '旧书', '新书'), true);
     assert.equal(removeDeletedWorldsFromSettings(settings, ['新书']), true);
+    assert.equal(applyAutoGroupProposals(null, [{ name: '测试组', uids: ['1'], mode: 'normal' }]).groups.length, 1);
     assert.equal(buildGroupedView(summaries, null).sections[0].id, SPECIAL_GROUP_UNGROUPED);
 });

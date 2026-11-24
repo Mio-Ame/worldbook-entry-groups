@@ -1,8 +1,7 @@
 /**
  * Worldbook Entry Groups — Pure domain model, IF-line mutex planner,
- * O(1) metadata-only per-chat route memory (supports in-save timeline jumps like 18yo -> 30yo),
- * scene-triggered auto-groups (e.g. NSFW off in daily plot / on during intimate scenes),
- * and prefix/divider/greeting auto-grouping engine.
+ * O(1) metadata-only per-chat route memory, multi-author Tavern Helper coordination,
+ * scene-triggered auto-groups (e.g. NSFW), and multi-style worldbook layering detector.
  *
  * Zero DOM or browser globals required; zero multi-floor chat history scanning.
  */
@@ -27,9 +26,13 @@ const TITLE_TAG_REGEX = /<!---?[\s\u3000]*title[\s\u3000]*[:：][\s\u3000]*(.*?)
 const DESC_TAG_REGEX = /<!---?[\s\u3000]*desc[\s\u3000]*[:：][\s\u3000]*(.*?)[\s\u3000]*-?-->/i;
 const LORE_TAG_REGEX = /<!---?[\s\u3000]*lore[\s\u3000]*[:：][\s\u3000]*([\d,\s\u3000，]+)[\s\u3000]*-?-->/i;
 const EXCLUDE_TAG_REGEX = /<!---?[\s\u3000]*exclude[\s\u3000]*[:：][\s\u3000]*([\d,\s\u3000，]+)[\s\u3000]*-?-->/i;
+const ROUTE_INDEX_TAG_REGEX = /<!---?[\s\u3000]*route[\s\u3000]*[:：][\s\u3000]*(\d+)[\s\u3000]*-?-->/i;
 
-const IF_NAME_HINT_REGEX = /(?:^|[\s【\[「(（·\-_/:：|｜])(?:if\s*线?|分支|路线|支线|世界线|结局线|if\d+|\d+岁线?)(?:$|[\s】\]」)）·\-_/:：|｜\d])/i;
-const NSFW_TITLE_HINT_REGEX = /\b(?:nsfw|r18|18\+|smut|ero)\b|(?:亲密剧情|亲密行为|亲密设定|情事|床笫|欢爱|肉体设定|敏感带|敏感点|性癖|瑟瑟|涩涩|成人向|情欲|交合|体位)/i;
+// Common / shared base lore names MUST stay NORMAL (never auto-marked as mutually exclusive IF lines!)
+const COMMON_BASE_NAME_REGEX = /(?:通用|常规|公共|基础|共用|主线基础|全局|必开|状态栏|变量列表|输出格式|输出规范|世界观基础)/i;
+const IF_NAME_HINT_REGEX = /(?:^|[\s【\[「(（·\-_/:：|｜])(?:if\s*线?|分支|路线|支线|世界线|结局线|if\d+|\d+岁线?)(?:$|[\s】\]」)）·\-_/:：|｜\d])|(?:线)$/i;
+const RADIO_SECTION_HINT_REGEX = /(?:自选|二选一|多选一|三选一|四选一|场景选择|身份选择|分支选择|路线选择)/i;
+const NSFW_TITLE_HINT_REGEX = /\b(?:nsfw|nfsw|r18|18\+|smut|ero|dirtytalk)\b|(?:亲密剧情|亲密行为|亲密设定|情事|床笫|欢爱|肉体设定|敏感带|敏感点|性癖|瑟瑟|涩涩|色情|成人向|情欲|交合|体位|炖肉)/i;
 
 /**
  * Built-in default trigger cues when a `scene` group leaves custom keywords blank.
@@ -45,21 +48,11 @@ export const DEFAULT_SCENE_KEYWORDS = Object.freeze([
     'nsfw', 'r18',
 ]);
 
-/**
- * Generate a compact unique group ID.
- * @param {string} [prefix='grp']
- * @returns {string}
- */
 export function createGroupId(prefix = 'grp') {
     const rand = Math.random().toString(36).slice(2, 7);
     return `${prefix}_${Date.now().toString(36)}_${rand}`;
 }
 
-/**
- * Parse a comma/newline separated keyword string into a deduplicated string list.
- * @param {string | string[] | null | undefined} raw
- * @returns {string[]}
- */
 export function normalizeKeywordList(raw) {
     const items = Array.isArray(raw)
         ? raw
@@ -76,12 +69,6 @@ export function normalizeKeywordList(raw) {
     return out.slice(0, 60);
 }
 
-/**
- * Normalize a single book's group configuration in place or from raw data.
- * Never touches worldbook entries; stores only plugin-local group metadata.
- *
- * @param {any} raw
- */
 export function normalizeBookConfig(raw) {
     const src = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
     const seenIds = new Set();
@@ -137,12 +124,6 @@ export function normalizeBookConfig(raw) {
     };
 }
 
-/**
- * Normalize a per-chat worldbook route profile (`chatMetadata` or fallback `chatProfiles[chatKey]`).
- * Lightweight metadata (~100-300 bytes), O(1) read/write, zero chat message scanning!
- *
- * @param {any} raw
- */
 export function normalizeChatProfile(raw) {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
     const worldName = String(raw.worldName ?? '').trim();
@@ -171,10 +152,6 @@ export function normalizeChatProfile(raw) {
     };
 }
 
-/**
- * Clone a book configuration cleanly for the undo stack.
- * @param {any} bookConfig
- */
 export function cloneBookConfig(bookConfig) {
     const norm = normalizeBookConfig(bookConfig);
     return {
@@ -187,11 +164,6 @@ export function cloneBookConfig(bookConfig) {
     };
 }
 
-/**
- * Normalize top-level extension settings while preserving unknown user keys.
- * @param {any} raw
- * @returns {Record<string, any>}
- */
 export function normalizeSettings(raw) {
     const src = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
     const palette = VALID_PALETTES.includes(src.palette) ? src.palette : 'paper';
@@ -244,9 +216,6 @@ export function normalizeSettings(raw) {
     };
 }
 
-/**
- * Store or update a fallback per-chat route profile inside `settings.chatProfiles` with LRU cap.
- */
 export function upsertStoredChatProfile(settings, chatKey, rawProfile) {
     const cleanKey = String(chatKey ?? '').trim();
     if (!settings || !cleanKey) return;
@@ -270,44 +239,91 @@ export function upsertStoredChatProfile(settings, chatKey, rawProfile) {
 }
 
 /**
- * Check whether an entry comment looks like a visual section divider banner.
+ * Strip decorative wrapper symbols, directional arrows (`⬇️` / `⬆️`), and outer emoji pairs
+ * from a divider comment so group names read cleanly (e.g. `——🐰🐰背景信息选择🦊🦊——` -> `背景信息选择`,
+ * `——⬇️⬇️USER身份自选⬇️⬇️——` -> `USER身份自选`).
+ *
+ * @param {string} rawInner
+ * @returns {string}
  */
-export function parseDividerComment(rawComment, meta = {}) {
-    const text = String(rawComment ?? '').trim();
-    if (!text) return { isDivider: false, label: '' };
+function cleanDividerLabelText(rawInner) {
+    let s = String(rawInner ?? '')
+        .replace(/[=\-—─━═_*~～✦✧★☆◆◇■□▼▽▲△▸▹◂◃#⬇️⬆️↓↑⤵️⤴️\ufe0f]/g, ' ')
+        .replace(/^[【\[「(（\s]+|[】\]」)）\s]+$/g, '')
+        // Strip leading & trailing decorative emoji runs while keeping CJK / ASCII / numbers intact
+        .replace(/^[\p{Extended_Pictographic}\s]+|[\p{Extended_Pictographic}\s]+$/gu, '')
+        .replace(/^(?:以下是|下面是|以上是|上面是)\s*/, '')
+        .replace(/\s*(?:结束|到此为止|分割线|分隔线)$/, '')
+        .replace(/\s+/g, ' ')
+        .trim();
 
-    const wrappedMatch = text.match(
-        /^(?:[=\-—─━═_*~～✦✧★☆◆◇■□▼▽▸▹#]{2,}|【[\s=\-—─━═_*~～]{1,})\s*(.+?)\s*(?:[=\-—─━═_*~～✦✧★☆◆◇■□▼▽◂◃#]{2,}|[\s=\-—─━═_*~～]{1,}】)?$/,
-    );
-    if (wrappedMatch) {
-        const cleaned = wrappedMatch[1]
-            .replace(/^[【\[「(（\s=\-—─━═_*~～]+|[】\]」)）\s=\-—─━═_*~～]+$/g, '')
-            .trim();
-        if (cleaned.length >= 1 && cleaned.length <= 28 && !/^[=\-—─━═_*~～\d\s]+$/.test(cleaned)) {
-            return { isDivider: true, label: cleaned };
+    // Trim long parenthetical author instructions in divider headers like `常规信息，以下所有除了选开都别动`
+    if (s.length > 10 && /[，,（(]/.test(s)) {
+        const headPart = s.split(/[，,（(]/)[0].trim();
+        if (headPart.length >= 2) {
+            s = headPart;
         }
     }
-
-    if (/^[=\-—─━═_*~～✦✧★☆◆◇■□\s]+$/.test(text)) {
-        return { isDivider: false, label: '' };
-    }
-
-    if (meta.disabled && !meta.hasContent && (meta.keyCount || 0) === 0) {
-        const bannerClean = text
-            .replace(/^(?:以下是|下面是|▼|▽|◆|■|●|▶|▸)\s*/, '')
-            .replace(/\s*(?:部分|专区|分割线|分隔线|▼|▽|◆|■|●|◀|◂)$/, '')
-            .replace(/^[【\[「(（\s]+|[】\]」)）\s]+$/g, '')
-            .trim();
-        if (bannerClean.length >= 2 && bannerClean.length <= 24 && bannerClean !== text) {
-            return { isDivider: true, label: bannerClean };
-        }
-    }
-
-    return { isDivider: false, label: '' };
+    return s;
 }
 
 /**
- * Extract lightweight entry summaries from a raw worldbook JSON object.
+ * Check whether an entry comment is a visual divider banner, distinguishing:
+ * - `'start'`: explicitly opens a bounded block (e.g. `——⬇️⬇️神女线⬇️⬇️——`, `【以下是世界观】`)
+ * - `'end'`: explicitly closes a bounded block (e.g. `——⬆️⬆️神女线⬆️⬆️——`, `=== 以上是权谋线 ===`)
+ * - `'section'`: single header divider that starts a new section until the next divider (e.g. `——🐰🐰背景信息选择🦊🦊——`, `=== 基础设定 ===`)
+ *
+ * @param {string} rawComment
+ * @param {{ disabled?: boolean, hasContent?: boolean, keyCount?: number }} [meta]
+ * @returns {{ isDivider: boolean, dividerKind: 'none' | 'start' | 'end' | 'section', label: string, isPureBanner: boolean }}
+ */
+export function parseDividerComment(rawComment, meta = {}) {
+    const text = String(rawComment ?? '').trim();
+    const isEmptyBodyAndKeys = !meta.hasContent && (meta.keyCount || 0) === 0;
+    if (!text) return { isDivider: false, dividerKind: 'none', label: '', isPureBanner: false };
+
+    const hasUpEndCue = /(?:⬆️|▲|△|↑|⤴️|以上是|上面是|到此为止|(?:^|\s)end(?:\s|$))/i.test(text);
+    const hasDownStartCue = /(?:⬇️|▼|▽|↓|⤵️|以下是|下面是)/i.test(text);
+
+    // 1. Explicit decorative line wrappers (`——...——`, `===...===`, `---...---`, `──...──`)
+    const wrappedMatch = text.match(
+        /^(?:[=\-—─━═_*~～✦✧★☆◆◇■□▼▽▲△▸▹#]{2,}|【[\s=\-—─━═_*~～]{1,})\s*(.+?)\s*(?:[=\-—─━═_*~～✦✧★☆◆◇■□▼▽▲△◂◃#]{2,}|[\s=\-—─━═_*~～]{1,}】)?$/,
+    );
+    if (wrappedMatch) {
+        const label = cleanDividerLabelText(wrappedMatch[1]);
+        if (hasUpEndCue && !hasDownStartCue) {
+            return { isDivider: true, dividerKind: 'end', label, isPureBanner: isEmptyBodyAndKeys };
+        }
+        if (label.length >= 1 && label.length <= 28) {
+            return {
+                isDivider: true,
+                dividerKind: hasDownStartCue ? 'start' : 'section',
+                label,
+                isPureBanner: isEmptyBodyAndKeys,
+            };
+        }
+        if (isEmptyBodyAndKeys) {
+            return { isDivider: true, dividerKind: 'end', label: '', isPureBanner: true };
+        }
+    }
+
+    // 2. Empty-body keyless banner entry (`【以下是世界观】`, `▼ 校园线 ▼`, `▲ 校园线结束 ▲`)
+    if (isEmptyBodyAndKeys && (hasDownStartCue || hasUpEndCue)) {
+        const label = cleanDividerLabelText(text);
+        if (hasUpEndCue && !hasDownStartCue) {
+            return { isDivider: true, dividerKind: 'end', label, isPureBanner: true };
+        }
+        if (label.length >= 2 && label.length <= 24) {
+            return { isDivider: true, dividerKind: 'start', label, isPureBanner: true };
+        }
+    }
+
+    return { isDivider: false, dividerKind: 'none', label: '', isPureBanner: false };
+}
+
+/**
+ * Extract lightweight entry summaries from a raw worldbook JSON object (supports both standalone
+ * SillyTavern worldbook JSON and character-card `character_book` format!).
  * Discards `entry.content` immediately so 200+ entries consume minimal memory on iOS WebViews.
  */
 export function extractWorldbookEntrySummaries(payload) {
@@ -315,7 +331,7 @@ export function extractWorldbookEntrySummaries(payload) {
     if (!entriesObj || typeof entriesObj !== 'object') return [];
 
     const pairs = Array.isArray(entriesObj)
-        ? entriesObj.map((e, i) => [String(e?.uid ?? i), e])
+        ? entriesObj.map((e, i) => [String(e?.uid ?? e?.id ?? i), e])
         : Object.entries(entriesObj);
 
     const summaries = [];
@@ -323,17 +339,22 @@ export function extractWorldbookEntrySummaries(payload) {
         const [fallbackKey, entry] = pairs[i];
         if (!entry || typeof entry !== 'object') continue;
 
-        const uid = String(entry.uid ?? fallbackKey).trim();
+        const uid = String(entry.uid ?? entry.id ?? fallbackKey).trim();
         if (!uid) continue;
         const num = Number(uid);
         const numericUid = Number.isInteger(num) && num >= 0 ? num : null;
 
         const rawComment = String(entry.comment ?? '').trim();
-        const allKeys = Array.isArray(entry.key)
-            ? entry.key.map((k) => String(k ?? '').trim()).filter(Boolean)
-            : [];
+        const rawKeyArr = Array.isArray(entry.key)
+            ? entry.key
+            : (Array.isArray(entry.keys) ? entry.keys : []);
+        const allKeys = rawKeyArr.map((k) => String(k ?? '').trim()).filter(Boolean);
         const keys = allKeys.slice(0, 6);
-        const disabled = Boolean(entry.disable);
+
+        const disabled = 'disable' in entry
+            ? Boolean(entry.disable)
+            : ('enabled' in entry ? !entry.enabled : false);
+
         const hasContent = Boolean(String(entry.content ?? '').trim());
         const dividerInfo = parseDividerComment(rawComment, {
             disabled,
@@ -342,9 +363,12 @@ export function extractWorldbookEntrySummaries(payload) {
         });
 
         const title = rawComment || keys.slice(0, 2).join(' / ') || `未命名条目 #${uid}`;
-        const order = Number.isFinite(Number(entry.order)) ? Number(entry.order) : 100;
-        const displayIndex = Number.isFinite(Number(entry.displayIndex))
-            ? Number(entry.displayIndex)
+        const order = Number.isFinite(Number(entry.order ?? entry.insertion_order))
+            ? Number(entry.order ?? entry.insertion_order)
+            : 100;
+        const rawDisplayIdx = entry.displayIndex ?? entry.extensions?.display_index;
+        const displayIndex = Number.isFinite(Number(rawDisplayIdx))
+            ? Number(rawDisplayIdx)
             : (Number.isFinite(Number(entry.order)) ? Number(entry.order) : (numericUid ?? i));
 
         summaries.push({
@@ -355,12 +379,14 @@ export function extractWorldbookEntrySummaries(payload) {
             keys,
             disabled,
             constant: Boolean(entry.constant),
-            vectorized: Boolean(entry.vectorized),
+            vectorized: Boolean(entry.vectorized ?? entry.extensions?.vectorized),
             selective: Boolean(entry.selective),
             order,
             displayIndex,
             isDivider: dividerInfo.isDivider,
+            dividerKind: dividerInfo.dividerKind,
             dividerLabel: dividerInfo.label,
+            isPureBanner: dividerInfo.isPureBanner,
         });
     }
 
@@ -373,9 +399,6 @@ export function extractWorldbookEntrySummaries(payload) {
     return summaries;
 }
 
-/**
- * Remove orphan entry UID assignments that no longer exist in the authoritative worldbook.
- */
 export function pruneOrphanAssignments(bookConfig, validUidSet) {
     if (!bookConfig?.assignments || !(validUidSet instanceof Set)) return 0;
     const groupIds = new Set((bookConfig.groups || []).map((g) => g.id));
@@ -389,9 +412,6 @@ export function pruneOrphanAssignments(bookConfig, validUidSet) {
     return removed;
 }
 
-/**
- * Build the structured group sections view purely from authoritative entries + bookConfig.
- */
 export function buildGroupedView(entries, rawBookConfig) {
     const bookConfig = normalizeBookConfig(rawBookConfig);
     const list = Array.isArray(entries) ? entries : [];
@@ -472,9 +492,6 @@ export function buildGroupedView(entries, rawBookConfig) {
     };
 }
 
-/**
- * Filter entries by search query and optional state filter.
- */
 export function matchEntries(entries, query, { multiTerm = false, statusFilter = 'all', greetingByUid = null } = {}) {
     const list = Array.isArray(entries) ? entries : [];
     const rawQ = String(query ?? '').trim().toLowerCase();
@@ -508,9 +525,6 @@ export function matchEntries(entries, query, { multiTerm = false, statusFilter =
     return matched;
 }
 
-/**
- * Compute a single-pass batch toggle plan (`Map<uid, nextDisabled>`) when toggling an entire group.
- */
 export function computeGroupTogglePlan(entries, rawBookConfig, groupId, targetEnabled) {
     const bookConfig = normalizeBookConfig(rawBookConfig);
     const list = Array.isArray(entries) ? entries : [];
@@ -519,7 +533,7 @@ export function computeGroupTogglePlan(entries, rawBookConfig, groupId, targetEn
     if (groupId === SPECIAL_GROUP_UNGROUPED) {
         for (const entry of list) {
             const assigned = bookConfig.assignments[entry.uid];
-            if (!assigned) {
+            if (!assigned && !entry.isPureBanner) {
                 plan.set(entry.uid, !targetEnabled);
             }
         }
@@ -569,9 +583,6 @@ export function computeGroupTogglePlan(entries, rawBookConfig, groupId, targetEn
     return plan;
 }
 
-/**
- * Compute a single-pass batch toggle plan (`Map<uid, nextDisabled>`) when toggling a single entry.
- */
 export function computeEntryTogglePlan(entries, rawBookConfig, uid, targetEnabled) {
     const bookConfig = normalizeBookConfig(rawBookConfig);
     const list = Array.isArray(entries) ? entries : [];
@@ -615,26 +626,43 @@ export function computeEntryTogglePlan(entries, rawBookConfig, uid, targetEnable
 }
 
 /**
- * Evaluate `scene` groups (e.g. NSFW / intimate lore) right before prompt WorldInfo assembly!
- * Inspects ONLY a tiny recent turn snippet (`recentText`, capped ~1200 chars — zero chat history scan):
- * - Turns ON a `scene` group immediately when its trigger cues appear in the latest 1–2 turns,
- *   setting its remaining active window to `cooldownTurns` (default 2 turns).
- * - Keeps it ON while `cooldown > 0` so brief dialogue exchanges mid-scene don't flicker off.
- * - Turns it OFF automatically once `cooldown` reaches 0 in normal peaceful plot!
+ * Compute a single-pass `Map<uid, nextDisabled>` to apply a greeting preset (`<!-- lore / exclude -->`)!
+ * Safely handles overlapping common + branch lore (e.g. `#1 灯节重逢` vs `#2 抢婚` vs `#9 神女user`):
+ * enables all `loreUids` of that greeting (unless excluded) and disables all other `managedUidSet` entries!
  *
- * @param {{
- *   entries: Array<any>,
- *   bookConfig: any,
- *   recentText: string,
- *   cooldownByGroupId?: Record<string, number>
- * }} params
- * @returns {{
- *   togglePlan: Map<string, boolean>,
- *   nextCooldownByGroupId: Record<string, number>,
- *   activatedGroups: string[],
- *   deactivatedGroups: string[]
- * }}
+ * @param {Array<any>} entries
+ * @param {ReturnType<typeof buildGreetingCoordinationIndex>} greetingIndex
+ * @param {number} swipeIndex
+ * @returns {{ plan: Map<string, boolean>, routeLabel: string } | null}
  */
+export function computeGreetingPresetPlan(entries, greetingIndex, swipeIndex) {
+    if (!greetingIndex?.greetings) return null;
+    const target = greetingIndex.greetings.find((g) => g.swipeIndex === Number(swipeIndex));
+    if (!target || (target.loreUids.length === 0 && target.excludeUids.length === 0)) return null;
+
+    const validUidSet = new Set((entries || []).map((e) => e.uid));
+    const activeSet = new Set(target.loreUids);
+    const excludeSet = new Set(target.excludeUids);
+    const plan = new Map();
+
+    for (const uid of greetingIndex.managedUidSet) {
+        if (!validUidSet.has(uid)) continue;
+        const shouldEnable = activeSet.has(uid) && !excludeSet.has(uid);
+        plan.set(uid, !shouldEnable);
+    }
+    for (const uid of activeSet) {
+        if (validUidSet.has(uid)) plan.set(uid, excludeSet.has(uid));
+    }
+    for (const uid of excludeSet) {
+        if (validUidSet.has(uid)) plan.set(uid, true);
+    }
+
+    const routeLabel = target.title
+        ? `${target.label} ${target.title}`
+        : `开场白 ${target.label}`;
+    return { plan, routeLabel };
+}
+
 export function evaluateSceneAutoToggle({
     entries,
     bookConfig: rawBookConfig,
@@ -701,10 +729,6 @@ export function evaluateSceneAutoToggle({
     };
 }
 
-/**
- * Apply a `uid -> nextDisabled` toggle plan onto a raw worldbook JSON payload in place.
- * Modifies ONLY `entry.disable`; 100% of titles, content, inclusion groups, and extensions remain untouched.
- */
 export function applyTogglePlanToPayload(payload, togglePlan) {
     const entriesObj = payload?.entries;
     if (!entriesObj || typeof entriesObj !== 'object' || !(togglePlan instanceof Map) || togglePlan.size === 0) {
@@ -716,13 +740,13 @@ export function applyTogglePlanToPayload(payload, togglePlan) {
     if (Array.isArray(entriesObj)) {
         entriesObj.forEach((entry, idx) => {
             if (entry && typeof entry === 'object') {
-                entryByUid.set(String(entry.uid ?? idx), entry);
+                entryByUid.set(String(entry.uid ?? entry.id ?? idx), entry);
             }
         });
     } else {
         for (const [k, entry] of Object.entries(entriesObj)) {
             if (entry && typeof entry === 'object') {
-                entryByUid.set(String(entry.uid ?? k), entry);
+                entryByUid.set(String(entry.uid ?? entry.id ?? k), entry);
             }
         }
     }
@@ -730,9 +754,13 @@ export function applyTogglePlanToPayload(payload, togglePlan) {
     for (const [uid, nextDisabled] of togglePlan.entries()) {
         const entry = entryByUid.get(String(uid));
         if (!entry) continue;
-        const currentDisabled = Boolean(entry.disable);
+        const currentDisabled = 'disable' in entry ? Boolean(entry.disable) : ('enabled' in entry ? !entry.enabled : false);
         if (currentDisabled !== Boolean(nextDisabled)) {
-            entry.disable = Boolean(nextDisabled);
+            if ('disable' in entry || !('enabled' in entry)) {
+                entry.disable = Boolean(nextDisabled);
+            } else {
+                entry.enabled = !nextDisabled;
+            }
             appliedChanges.push({ uid: String(uid), disabled: Boolean(nextDisabled) });
         }
     }
@@ -744,16 +772,17 @@ export function applyTogglePlanToPayload(payload, togglePlan) {
 }
 
 /**
- * Parse greeting HTML comment tags (`<!-- title / desc / lore / exclude -->`) on a single greeting string.
+ * Parse greeting HTML comment tags (`<!-- title / desc / lore / exclude / route -->`).
  */
 export function parseGreetingCommentTags(rawText) {
     const text = String(rawText ?? '').slice(0, 1200);
-    if (!text) return { title: '', desc: '', loreUids: [], excludeUids: [] };
+    if (!text) return { title: '', desc: '', loreUids: [], excludeUids: [], routeNumber: null };
 
     const titleMatch = text.match(TITLE_TAG_REGEX);
     const descMatch = text.match(DESC_TAG_REGEX);
     const loreMatch = text.match(LORE_TAG_REGEX);
     const excludeMatch = text.match(EXCLUDE_TAG_REGEX);
+    const routeMatch = text.match(ROUTE_INDEX_TAG_REGEX);
 
     const parseUidList = (matchObj) => {
         if (!matchObj?.[1]) return [];
@@ -772,17 +801,17 @@ export function parseGreetingCommentTags(rawText) {
         return out;
     };
 
+    const routeNum = routeMatch?.[1] ? Number.parseInt(routeMatch[1], 10) : null;
+
     return {
         title: titleMatch?.[1]?.trim() || '',
         desc: descMatch?.[1]?.trim() || '',
         loreUids: parseUidList(loreMatch),
         excludeUids: parseUidList(excludeMatch),
+        routeNumber: Number.isInteger(routeNum) ? routeNum : null,
     };
 }
 
-/**
- * Build a greeting coordination index purely from character card greeting headers (reads first 1200 chars per greeting).
- */
 export function buildGreetingCoordinationIndex(source = {}) {
     const cardGreetingsRaw = [];
     const first = String(source.firstMes ?? '');
@@ -820,6 +849,7 @@ export function buildGreetingCoordinationIndex(source = {}) {
             desc: parsed.desc || parsedCard.desc,
             loreUids: parsed.loreUids,
             excludeUids: parsed.excludeUids,
+            routeNumber: parsed.routeNumber ?? parsedCard.routeNumber ?? null,
         };
         greetings.push(info);
 
@@ -834,6 +864,7 @@ export function buildGreetingCoordinationIndex(source = {}) {
         }
     });
 
+    const presetGreetings = greetings.filter((g) => g.loreUids.length > 0 || g.excludeUids.length > 0);
     const currentSwipeId = Number.isInteger(source.currentSwipeId) && source.currentSwipeId >= 0
         ? source.currentSwipeId
         : null;
@@ -844,6 +875,7 @@ export function buildGreetingCoordinationIndex(source = {}) {
     return {
         hasManagedEntries: managedUidSet.size > 0 || byUid.size > 0,
         greetings,
+        presetGreetings,
         byUid,
         managedUidSet,
         currentSwipeId,
@@ -852,10 +884,32 @@ export function buildGreetingCoordinationIndex(source = {}) {
 }
 
 /**
- * Capture initial route ONLY on a brand-new 1-message chat (`chat.length === 1`)
- * by reading the first 1200 chars of `floorZeroMes`.
- * NEVER touches or iterates multi-floor chat history!
+ * Extract a friendly route label from chat-scoped Tavern Helper variables if any author script
+ * stored one (e.g. `chatMetadata.variables.zyz_route = { name: '伪骨科' }` or `route_name`),
+ * without coupling to any specific character name!
+ *
+ * @param {any} chatMetadata
+ * @returns {string}
  */
+export function extractExternalScriptRouteLabel(chatMetadata) {
+    const vars = chatMetadata?.variables;
+    if (!vars || typeof vars !== 'object') return '';
+
+    for (const [key, val] of Object.entries(vars)) {
+        if (!/route|line|branch|stage|路线|线路|分支/i.test(key)) continue;
+        if (typeof val === 'string' && val.trim() && val.trim().length <= 32) {
+            return val.trim();
+        }
+        if (val && typeof val === 'object') {
+            const candidate = val.name || val.title || val.route || val.label;
+            if (typeof candidate === 'string' && candidate.trim() && candidate.trim().length <= 32) {
+                return candidate.trim();
+            }
+        }
+    }
+    return '';
+}
+
 export function buildInitialProfileFromFloorZero({
     worldName,
     floorZeroMes,
@@ -899,20 +953,20 @@ export function buildInitialProfileFromFloorZero({
         }
     }
 
-    const routeLabel = matchedIfGroup?.name || parsed.title || '开场白初始路线';
+    const routeLabel = parsed.title || matchedIfGroup?.name || '开场白初始路线';
     return normalizeChatProfile({
         worldName: cleanWorld,
         routeLabel,
-        ifGroupId: matchedIfGroup?.id || '',
+        ifGroupId: parsed.title ? '' : (matchedIfGroup?.id || ''),
         entryDisabledMap,
         updatedAt: Date.now(),
     });
 }
 
 /**
- * Snapshot the current worldbook's IF-line & non-scene grouped entry states into a per-chat save profile.
- * Supports seamless in-save timeline jumps (e.g., switching from 18岁线 -> 30岁线 mid-save updates `chatMetadata`
- * to 30岁线 immediately, and excludes transient `scene`/NSFW toggles from permanent route lock!).
+ * Snapshot the current worldbook's entry states into a per-chat save profile.
+ * Records ALL non-scene, non-pure-banner entries so multi-layer presets (e.g. 背景 + 变量 + 支线)
+ * switched by external Tavern Helper scripts or multi-group combinations are 100% preserved per save!
  */
 export function buildChatProfileFromCurrentState(worldName, entries, rawBookConfig, opts = {}) {
     const cleanWorld = String(worldName ?? '').trim();
@@ -923,7 +977,6 @@ export function buildChatProfileFromCurrentState(worldName, entries, rawBookConf
     const sceneGroupIds = new Set(
         bookConfig.groups.filter((g) => g.mode === GROUP_MODES.SCENE).map((g) => g.id),
     );
-    const managedGreetingUids = opts.greetingIndex?.managedUidSet || new Set();
 
     let activeIfGroup = null;
     if (opts.preferredIfGroupId) {
@@ -941,22 +994,19 @@ export function buildChatProfileFromCurrentState(worldName, entries, rawBookConf
         }
     }
 
-    const nonSceneAssignedCount = Object.values(bookConfig.assignments).filter((gid) => !sceneGroupIds.has(gid)).length;
-    const hasAnyGroupOrManaged = nonSceneAssignedCount > 0 || managedGreetingUids.size > 0;
     const entryDisabledMap = {};
-
     for (const entry of list) {
+        if (entry.isPureBanner) continue;
         const gid = bookConfig.assignments[entry.uid];
         // Never lock transient `scene` (NSFW) group states into the save's permanent route profile
         if (gid && sceneGroupIds.has(gid)) continue;
-        if (!hasAnyGroupOrManaged || gid || managedGreetingUids.has(entry.uid)) {
-            entryDisabledMap[entry.uid] = Boolean(entry.disabled);
-        }
+        entryDisabledMap[entry.uid] = Boolean(entry.disabled);
     }
 
-    const enabledCount = list.filter((e) => !e.disabled).length;
+    const enabledCount = list.filter((e) => !e.disabled && !e.isPureBanner).length;
     const routeLabel = String(opts.customLabel ?? '').trim()
         || activeIfGroup?.name
+        || String(opts.externalRouteHint ?? '').trim()
         || `本档配置（已开 ${enabledCount} 条）`;
 
     return normalizeChatProfile({
@@ -968,9 +1018,6 @@ export function buildChatProfileFromCurrentState(worldName, entries, rawBookConf
     });
 }
 
-/**
- * Compute the single-pass `Map<uid, nextDisabled>` needed to restore a chat save's bound profile!
- */
 export function computeChatProfileRestorePlan(entries, rawBookConfig, rawChatProfile) {
     const profile = normalizeChatProfile(rawChatProfile);
     const list = Array.isArray(entries) ? entries : [];
@@ -1007,9 +1054,6 @@ export function computeChatProfileRestorePlan(entries, rawBookConfig, rawChatPro
     return plan;
 }
 
-/**
- * Format a group's entry UIDs as a standard greeting automation HTML comment.
- */
 export function formatGreetingCommentTag(uids, tagType = 'lore') {
     const nums = [...new Set(
         (uids || [])
@@ -1021,16 +1065,48 @@ export function formatGreetingCommentTag(uids, tagType = 'lore') {
     return `<!-- ${tag}: ${nums.join(',')} -->`;
 }
 
+/**
+ * Determine whether a group name represents a mutually-exclusive IF route,
+ * explicitly EXCLUDING common/shared lore groups like `通用线`, `常规线`, `公共设定`!
+ */
 export function looksLikeIfLineName(groupName) {
     const clean = String(groupName ?? '').trim();
     if (!clean) return false;
+    if (COMMON_BASE_NAME_REGEX.test(clean)) return false;
     return IF_NAME_HINT_REGEX.test(clean);
+}
+
+export function looksLikeRadioChoiceSection(groupName, memberComments = []) {
+    const clean = String(groupName ?? '').trim();
+    if (clean && RADIO_SECTION_HINT_REGEX.test(clean)) return true;
+    if (memberComments.length >= 2) {
+        const choiceHintCount = memberComments.filter((c) => /(?:二选一|多选一|三选一|四选一)/.test(String(c ?? ''))).length;
+        if (choiceHintCount >= 2) return true;
+    }
+    return false;
 }
 
 export function looksLikeNsfwEntry(titleOrKeys) {
     const clean = String(titleOrKeys ?? '').trim();
     if (!clean) return false;
     return NSFW_TITLE_HINT_REGEX.test(clean);
+}
+
+/**
+ * Infer the most natural group mode from a group's name and its member entry titles.
+ */
+function inferSuggestedGroupMode(label, memberEntries = []) {
+    const clean = String(label ?? '').trim();
+    if (looksLikeNsfwEntry(clean) && !/人设|优化/.test(clean)) {
+        return GROUP_MODES.SCENE;
+    }
+    if (looksLikeRadioChoiceSection(clean, memberEntries.map((e) => e.rawComment || e.title))) {
+        return GROUP_MODES.RADIO;
+    }
+    if (looksLikeIfLineName(clean)) {
+        return GROUP_MODES.IF_LINE;
+    }
+    return GROUP_MODES.NORMAL;
 }
 
 export function extractEntryTitlePrefix(rawTitle) {
@@ -1044,8 +1120,12 @@ export function extractEntryTitlePrefix(rawTitle) {
 
     const bracketMatch = text.match(/^(?:【([^】]{1,18})】|\[([^\]]{1,18})\]|「([^」]{1,18})」|（([^）]{1,18})）|\(([^)]{1,18})\))\s*(.+)$/);
     if (bracketMatch) {
-        const candidate = (bracketMatch[1] || bracketMatch[2] || bracketMatch[3] || bracketMatch[4] || bracketMatch[5] || '').trim();
+        let candidate = (bracketMatch[1] || bracketMatch[2] || bracketMatch[3] || bracketMatch[4] || bracketMatch[5] || '').trim();
+        // Strip leading card-suit or symbol icons like `♠️权谋` -> `权谋`, `🔴` -> skip if empty
+        candidate = candidate.replace(/^[\p{Extended_Pictographic}♠♥♣♦♤♡♧♢\ufe0f\s]+/gu, '').trim();
         if (candidate && !/^\d+$/.test(candidate)) {
+            // Note: `【常规·助理线】` / `【常规·小演员线】` have distinct sub-route names inside brackets;
+            // normalize `常规·XX线` only if standalone, or group `【常规·...】` under `常规分支` when each bracket is unique!
             return candidate;
         }
     }
@@ -1063,8 +1143,14 @@ export function extractEntryTitlePrefix(rawTitle) {
 }
 
 /**
- * Detect candidate entry groups automatically using NSFW scene hints, greeting tags,
- * divider banners, and title prefixes.
+ * Detect candidate entry groups automatically across real-world worldbook authoring styles:
+ * 1. Bounded paired dividers (`——⬇️⬇️USER身份自选⬇️⬇️——` ... `——⬆️⬆️USER身份自选⬆️⬆️——`)
+ *    and single section dividers (`——🐰🐰背景信息选择🦊🦊——`, `=== 基础设定 ===`),
+ *    skipping pure empty banner entries from toggle membership!
+ * 2. Bracket / delimiter prefixes (`【通用线】`, `【将军线】`, `[18岁线]`) on remaining entries,
+ *    never mislabeling `通用线` / `常规线` as mutually-exclusive IF lines!
+ * 3. NSFW / intimate entries (`NSFW`, `nfsw`, `R18`, `床笫`, `敏感带`).
+ * 4. Optional non-overlapping greeting `<!-- lore -->` branches (when greetings have disjoint UIDs).
  */
 export function detectAutoGroups(entries, {
     strategy = 'smart',
@@ -1078,10 +1164,109 @@ export function detectAutoGroups(entries, {
 
     const isEligible = (uid) => !onlyUngrouped || !assignedObj[uid];
 
+    // 1. Divider block detection (supports both `⬇️...⬆️` bounded blocks and `section` headers!)
+    const detectFromDividers = (claimedSet, { boundedOnly = false } = {}) => {
+        const rawBlocks = [];
+        let currentBlock = null;
+
+        for (const entry of list) {
+            if (entry.isDivider) {
+                if (entry.dividerKind === 'end') {
+                    currentBlock = null;
+                    continue;
+                }
+                if (boundedOnly && entry.dividerKind !== 'start') {
+                    continue;
+                }
+                if (entry.dividerLabel) {
+                    currentBlock = {
+                        label: entry.dividerLabel,
+                        kind: entry.dividerKind,
+                        entries: [],
+                    };
+                    // Include divider entry ONLY if it carries actual prompt content or trigger keys!
+                    if (!entry.isPureBanner && isEligible(entry.uid) && !claimedSet.has(entry.uid)) {
+                        currentBlock.entries.push(entry);
+                    }
+                    rawBlocks.push(currentBlock);
+                }
+                continue;
+            }
+
+            if (currentBlock && isEligible(entry.uid) && !claimedSet.has(entry.uid)) {
+                currentBlock.entries.push(entry);
+            }
+        }
+
+        const meaningful = rawBlocks.filter((b) => b.entries.length >= 1);
+        if (!boundedOnly && meaningful.length < 2) return [];
+        if (boundedOnly && meaningful.length < 1) return [];
+
+        const mergedByLabel = new Map();
+        for (const b of meaningful) {
+            if (!mergedByLabel.has(b.label)) mergedByLabel.set(b.label, []);
+            mergedByLabel.get(b.label).push(...b.entries);
+        }
+
+        const out = [];
+        let idx = 0;
+        for (const [label, memberEntries] of mergedByLabel.entries()) {
+            if (memberEntries.length === 0) continue;
+            // In smart mode, if a bounded block's entries ALREADY share a cleaner `【前缀】` (like `⬇️⬇️神女线⬇️⬇️` containing `【神女线】...`),
+            // let prefix clustering handle prefixed ones UNLESS the entries lack prefixes (like `USER身份自选` -> `高门贵女user` / `公主user`)!
+            if (boundedOnly) {
+                const unprefixed = memberEntries.filter((e) => !extractEntryTitlePrefix(e.rawComment || e.title));
+                if (unprefixed.length === 0) continue;
+            }
+
+            const uids = memberEntries.map((e) => e.uid);
+            for (const uid of uids) claimedSet.add(uid);
+            out.push({
+                key: `divider_${idx++}_${label}`,
+                name: label,
+                suggestedMode: inferSuggestedGroupMode(label, memberEntries),
+                uids,
+                source: 'divider',
+            });
+        }
+        return out;
+    };
+
+    // 2. Prefix clustering (`【通用线】`, `【将军线】`, `[18岁线]`, `【常规·...】`)
+    const detectFromPrefixes = (claimedSet) => {
+        const buckets = new Map();
+        for (const entry of list) {
+            if (entry.isDivider && entry.isPureBanner) continue;
+            if (!isEligible(entry.uid) || claimedSet.has(entry.uid)) continue;
+            const prefix = extractEntryTitlePrefix(entry.rawComment || entry.title);
+            if (!prefix) continue;
+            if (!buckets.has(prefix)) buckets.set(prefix, []);
+            buckets.get(prefix).push(entry);
+        }
+
+        const out = [];
+        let idx = 0;
+        for (const [prefix, memberEntries] of buckets.entries()) {
+            const isSpecial = looksLikeIfLineName(prefix) || looksLikeNsfwEntry(prefix);
+            if (memberEntries.length < 2 && !isSpecial) continue;
+            const uids = memberEntries.map((e) => e.uid);
+            for (const uid of uids) claimedSet.add(uid);
+            out.push({
+                key: `prefix_${idx++}_${prefix}`,
+                name: prefix,
+                suggestedMode: inferSuggestedGroupMode(prefix, memberEntries),
+                uids,
+                source: 'prefix',
+            });
+        }
+        return out;
+    };
+
+    // 3. NSFW / Intimate scene entries
     const detectNsfwSceneGroup = (claimedSet) => {
         const nsfwUids = [];
         for (const entry of list) {
-            if (entry.isDivider) continue;
+            if (entry.isDivider && entry.isPureBanner) continue;
             if (!isEligible(entry.uid) || claimedSet.has(entry.uid)) continue;
             const probe = `${entry.rawComment || entry.title} ${(entry.keys || []).join(' ')}`;
             if (looksLikeNsfwEntry(probe)) {
@@ -1099,99 +1284,49 @@ export function detectAutoGroups(entries, {
         }];
     };
 
+    // 4. Greeting `<!-- lore -->` tags (extracts ONLY unique per-greeting UIDs when greetings share common base UIDs!)
     const detectFromGreetings = (claimedSet) => {
-        const out = [];
-        const greets = greetingIndex?.greetings || [];
+        const greets = (greetingIndex?.greetings || []).filter((g) => Array.isArray(g.loreUids) && g.loreUids.length > 0);
+        if (greets.length === 0) return [];
+
+        // Count how many greetings reference each UID: UIDs shared across >50% of greetings (and >=2 greetings) are common base lore!
+        const freq = new Map();
         for (const g of greets) {
-            if (!Array.isArray(g.loreUids) || g.loreUids.length === 0) continue;
+            for (const u of g.loreUids) {
+                freq.set(u, (freq.get(u) || 0) + 1);
+            }
+        }
+        const sharedBaseUids = [];
+        const threshold = greets.length >= 3 ? Math.ceil(greets.length * 0.5) : 2;
+        for (const [u, count] of freq.entries()) {
+            if (greets.length >= 2 && count >= threshold && validEntryMap.has(u) && isEligible(u) && !claimedSet.has(u)) {
+                sharedBaseUids.push(u);
+            }
+        }
+
+        const out = [];
+        if (sharedBaseUids.length > 0) {
+            for (const u of sharedBaseUids) claimedSet.add(u);
+            out.push({
+                key: 'greeting_common_base',
+                name: '公共基础设定',
+                suggestedMode: GROUP_MODES.NORMAL,
+                uids: sharedBaseUids,
+                source: 'greeting',
+            });
+        }
+
+        for (const g of greets) {
             const uids = g.loreUids.filter((uid) => validEntryMap.has(uid) && isEligible(uid) && !claimedSet.has(uid));
             if (uids.length === 0) continue;
             for (const uid of uids) claimedSet.add(uid);
             const cleanTitle = g.title ? g.title.slice(0, 24) : `开场白 ${g.label}`;
-            const groupName = g.title ? `IF · ${cleanTitle}` : `IF · 开场白 ${g.label}`;
             out.push({
                 key: `greeting_${g.swipeIndex}`,
-                name: groupName,
+                name: g.title ? `IF · ${cleanTitle}` : `IF · 开场白 ${g.label}`,
                 suggestedMode: GROUP_MODES.IF_LINE,
                 uids,
                 source: 'greeting',
-            });
-        }
-        return out;
-    };
-
-    const detectFromDividers = (claimedSet) => {
-        const rawBlocks = [];
-        let currentBlock = null;
-
-        for (const entry of list) {
-            if (entry.isDivider && entry.dividerLabel) {
-                currentBlock = { label: entry.dividerLabel, uids: [] };
-                if (isEligible(entry.uid) && !claimedSet.has(entry.uid)) {
-                    currentBlock.uids.push(entry.uid);
-                }
-                rawBlocks.push(currentBlock);
-                continue;
-            }
-            if (currentBlock && isEligible(entry.uid) && !claimedSet.has(entry.uid)) {
-                currentBlock.uids.push(entry.uid);
-            }
-        }
-
-        const meaningful = rawBlocks.filter((b) => b.uids.length >= 1);
-        if (meaningful.length < 2) return [];
-
-        const mergedByLabel = new Map();
-        for (const b of meaningful) {
-            if (!mergedByLabel.has(b.label)) mergedByLabel.set(b.label, []);
-            mergedByLabel.get(b.label).push(...b.uids);
-        }
-
-        const out = [];
-        let idx = 0;
-        for (const [label, uids] of mergedByLabel.entries()) {
-            if (uids.length === 0) continue;
-            for (const uid of uids) claimedSet.add(uid);
-            const suggestedMode = looksLikeNsfwEntry(label)
-                ? GROUP_MODES.SCENE
-                : (looksLikeIfLineName(label) ? GROUP_MODES.IF_LINE : GROUP_MODES.NORMAL);
-            out.push({
-                key: `divider_${idx++}_${label}`,
-                name: label,
-                suggestedMode,
-                uids,
-                source: 'divider',
-            });
-        }
-        return out;
-    };
-
-    const detectFromPrefixes = (claimedSet) => {
-        const buckets = new Map();
-        for (const entry of list) {
-            if (entry.isDivider) continue;
-            if (!isEligible(entry.uid) || claimedSet.has(entry.uid)) continue;
-            const prefix = extractEntryTitlePrefix(entry.rawComment || entry.title);
-            if (!prefix) continue;
-            if (!buckets.has(prefix)) buckets.set(prefix, []);
-            buckets.get(prefix).push(entry.uid);
-        }
-
-        const out = [];
-        let idx = 0;
-        for (const [prefix, uids] of buckets.entries()) {
-            const isSpecial = looksLikeIfLineName(prefix) || looksLikeNsfwEntry(prefix);
-            if (uids.length < 2 && !isSpecial) continue;
-            for (const uid of uids) claimedSet.add(uid);
-            const suggestedMode = looksLikeNsfwEntry(prefix)
-                ? GROUP_MODES.SCENE
-                : (looksLikeIfLineName(prefix) ? GROUP_MODES.IF_LINE : GROUP_MODES.NORMAL);
-            out.push({
-                key: `prefix_${idx++}_${prefix}`,
-                name: prefix,
-                suggestedMode,
-                uids,
-                source: 'prefix',
             });
         }
         return out;
@@ -1203,19 +1338,36 @@ export function detectAutoGroups(entries, {
     if (strategy === 'divider') return detectFromDividers(claimed);
     if (strategy === 'prefix') return detectFromPrefixes(claimed);
 
+    // Smart combined strategy:
+    // Check whether the author structured the whole book with section dividers (e.g. `——🐰🐰...🦊🦊——` covering >60% of entries)
+    const nonBannerCount = list.filter((e) => !e.isPureBanner).length;
+    const trialDividerClaimed = new Set();
+    const fullSectionDividers = detectFromDividers(trialDividerClaimed, { boundedOnly: false });
+    const hasComprehensiveSectionLayers =
+        fullSectionDividers.length >= 3 &&
+        nonBannerCount > 0 &&
+        trialDividerClaimed.size / nonBannerCount >= 0.65 &&
+        !list.some((e) => e.dividerKind === 'end');
+
     const results = [];
+    if (hasComprehensiveSectionLayers) {
+        // Book is already cleanly layered top-to-bottom by author section banners! Preserve exact author layers!
+        return detectFromDividers(claimed, { boundedOnly: false });
+    }
+
+    // Otherwise:
+    // 1) Extract standalone NSFW entries first -> 2) Bounded `⬇️...⬆️` unprefixed blocks (like `USER身份自选`)
+    // -> 3) Prefix clusters (`【通用线】`, `【将军线】`, `【神女线】`) -> 4) Remaining section dividers / greeting branches
     results.push(...detectNsfwSceneGroup(claimed));
-    if (greetingIndex?.hasManagedEntries) {
+    results.push(...detectFromDividers(claimed, { boundedOnly: true }));
+    results.push(...detectFromPrefixes(claimed));
+    results.push(...detectFromDividers(claimed, { boundedOnly: false }));
+    if (results.length === 0 && greetingIndex?.hasManagedEntries) {
         results.push(...detectFromGreetings(claimed));
     }
-    results.push(...detectFromDividers(claimed));
-    results.push(...detectFromPrefixes(claimed));
     return results;
 }
 
-/**
- * Apply selected auto-detected group proposals into a bookConfig cleanly.
- */
 export function applyAutoGroupProposals(rawBookConfig, proposals, { replaceExisting = false } = {}) {
     const next = replaceExisting
         ? { groups: [], assignments: {}, ungroupedCollapsed: false }
@@ -1258,9 +1410,6 @@ export function applyAutoGroupProposals(rawBookConfig, proposals, { replaceExist
     return next;
 }
 
-/**
- * Migrate plugin settings when `worldbook-organizer` renames a worldbook.
- */
 export function migrateSettingsOnWorldRename(settings, oldName, newName) {
     const cleanOld = String(oldName ?? '').trim();
     const cleanNew = String(newName ?? '').trim();
@@ -1308,9 +1457,6 @@ export function migrateSettingsOnWorldRename(settings, oldName, newName) {
     return changed;
 }
 
-/**
- * Clean up plugin settings when worldbooks are deleted.
- */
 export function removeDeletedWorldsFromSettings(settings, deletedNames) {
     if (!settings || !Array.isArray(deletedNames) || deletedNames.length === 0) return false;
     const delSet = new Set(deletedNames.map((n) => String(n ?? '').trim()).filter(Boolean));

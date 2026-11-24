@@ -14,6 +14,7 @@ import {
     removeDeletedWorldsFromSettings,
 } from './src/core.js';
 import {
+    captureExternalWorldbookSwitchForActiveChat,
     clearRuntimeBookSnapshots,
     ensureWorldInfoModule,
     getCurrentCharacterPrimaryWorldName,
@@ -39,12 +40,14 @@ import {
     teardownPanels,
 } from './src/panel.js';
 
-const STYLE_ASSET_VERSION = '0.3.0';
+const STYLE_ASSET_VERSION = '0.4.0';
 
 let _initialized = false;
 let _nativeMountObserver = null;
 let _greetingSyncTimer = null;
 let _chatSwitchSyncTimer = null;
+let _externalFollowTimer = null;
+let _suppressExternalFollowUntil = 0;
 /** @type {Array<{ event: string, handler: Function }>} */
 const _boundHostEvents = [];
 let _onWboRenamed = null;
@@ -276,10 +279,24 @@ export async function init() {
     });
     trackHostEvent(eventSource, et.WORLDINFO_ENTRIES_LOADED, syncEntryPointsIdle);
     trackHostEvent(eventSource, et.WORLDINFO_UPDATED, (worldName) => {
-        if (worldName) clearRuntimeBookSnapshots(String(worldName).trim());
-        if (!isEntryGroupsModalOpen() || isWithinSelfWriteWindow()) return;
+        const cleanUpdated = worldName ? String(worldName).trim() : '';
+        if (cleanUpdated) clearRuntimeBookSnapshots(cleanUpdated);
+        if (isWithinSelfWriteWindow()) return;
+
+        // Follow external Tavern Helper script switches (unless right in the middle of a chat switch!)
+        if (Date.now() > _suppressExternalFollowUntil) {
+            clearTimeout(_externalFollowTimer);
+            _externalFollowTimer = setTimeout(async () => {
+                _externalFollowTimer = null;
+                if (!_initialized || isWithinSelfWriteWindow() || Date.now() <= _suppressExternalFollowUntil) return;
+                await captureExternalWorldbookSwitchForActiveChat(cleanUpdated);
+                syncAllNativeEntryPoints();
+            }, 460);
+        }
+
+        if (!isEntryGroupsModalOpen()) return;
         const openBook = getCurrentModalWorldName();
-        if (!worldName || String(worldName).trim() === openBook) {
+        if (!cleanUpdated || cleanUpdated === openBook) {
             scheduleOpenModalSync(320);
         }
     });
@@ -297,6 +314,10 @@ export async function init() {
 
     // O(1) metadata restore when switching chat saves (`CHAT_CHANGED`)
     trackHostEvent(eventSource, et.CHAT_CHANGED, () => {
+        // Suppress external floor-0 script echo during the first 900ms of a chat switch so our saved route wins!
+        _suppressExternalFollowUntil = Date.now() + 900;
+        clearTimeout(_externalFollowTimer);
+        _externalFollowTimer = null;
         syncEntryPointsIdle();
         scheduleChatSaveRouteSync('chat-changed', 650);
     });
@@ -322,6 +343,8 @@ export function onDisable() {
     _greetingSyncTimer = null;
     clearTimeout(_chatSwitchSyncTimer);
     _chatSwitchSyncTimer = null;
+    clearTimeout(_externalFollowTimer);
+    _externalFollowTimer = null;
 
     if (_nativeMountObserver) {
         _nativeMountObserver.disconnect();
